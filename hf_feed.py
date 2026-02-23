@@ -15,7 +15,7 @@ from models import Paper
 # It is preferred over HTML scraping and third-party feeds for stability.
 HF_DAILY_PAPERS_API_URL = "https://huggingface.co/api/daily_papers"
 REQUEST_TIMEOUT_SECONDS = 20
-_DEFAULT_MAX_AGE_DAYS = 90
+_DEFAULT_MAX_AGE_DAYS = 180
 
 
 def fetch_papers(limit: int | None = None, max_age_days: int | None = None) -> list[Paper]:
