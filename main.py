@@ -8,6 +8,7 @@ import logging
 from dotenv import load_dotenv
 
 from csv_sink import paper_already_exists, write_paper_entry
+from filters import is_potential_startup_paper
 from hf_feed import fetch_papers
 from llm_client import analyze_paper
 
@@ -29,11 +30,20 @@ def run(limit: int | None, dry_run: bool) -> None:
     papers = fetch_papers(limit=limit)
     logging.info("Fetched %s papers from Hugging Face Daily Papers", len(papers))
 
+    # Stage 1: heuristic pre-filter — no LLM calls, no cost.
+    viable = [p for p in papers if is_potential_startup_paper(p)]
+    logging.info(
+        "Heuristic filter: total=%s, viable=%s, dropped=%s",
+        len(papers),
+        len(viable),
+        len(papers) - len(viable),
+    )
+
     processed = 0
     skipped = 0
     failed = 0
 
-    for paper in papers:
+    for paper in viable:
         logging.info("Evaluating paper: %s", paper.title)
         if paper_already_exists(paper):
             skipped += 1
@@ -42,7 +52,7 @@ def run(limit: int | None, dry_run: bool) -> None:
 
         if dry_run:
             processed += 1
-            logging.info("[dry-run] Would analyze and create Notion entry: %s", paper.title)
+            logging.info("[dry-run] Would process: %s", paper.title)
             continue
 
         try:
