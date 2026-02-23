@@ -1,4 +1,4 @@
-"""Stage 3 — two-agent Claude debate for paper evaluation."""
+"""Stage 3 — true two-agent Claude debate for paper evaluation."""
 
 from __future__ import annotations
 
@@ -22,96 +22,162 @@ _PLACEHOLDER_VERDICT: dict[str, Any] = {
     },
 }
 
-_SYSTEM_PROMPT = (
-    "You are simulating a conversation between two experts evaluating ML papers "
-    "as startup ideas. You must output ONLY valid JSON following the specified "
-    "schema. No prose outside JSON."
-)
-
-_VERDICT_SCHEMA = """{
-  "technical_founder": {
-    "score": <int 1-5>,
-    "rationale": "<1-2 sentences>"
-  },
-  "accelerator_partner": {
-    "score": <int 1-5>,
-    "rationale": "<1-2 sentences>"
-  },
-  "final_verdict": {
-    "score": <int 1-5>,
-    "label": "keep | maybe | drop",
-    "reason": "<1-2 sentences>"
-  }
-}"""
-
 _REQUIRED_VERDICT_KEYS: frozenset[str] = frozenset({
     "technical_founder",
     "accelerator_partner",
     "final_verdict",
 })
 
+# --- Agent 1: Technical Founder ---
+
+_TF_SYSTEM = (
+    "You are a Technical Founder / Staff Research Engineer evaluating ML papers "
+    "for startup potential. Assess technical feasibility, novelty, and defensible "
+    "technical moat. Reply ONLY with valid JSON: "
+    '{\"score\": <int 1-5>, \"rationale\": \"<1-2 sentences>\"}'
+)
+
+# --- Agent 2: Accelerator Partner ---
+
+_AP_SYSTEM = (
+    "You are a Deep-Tech Accelerator Partner evaluating ML papers for startup "
+    "potential. Assess market pull, fundability, and accelerator story. A Technical "
+    "Founder has already reviewed this paper — read their view, then give your own "
+    "assessment AND a final converged verdict. Reply ONLY with valid JSON following "
+    "this schema:\n"
+    "{\n"
+    '  "accelerator_partner": {"score": <int 1-5>, "rationale": "<1-2 sentences>"},\n'
+    '  "final_verdict": {"score": <int 1-5>, "label": "keep|maybe|drop", "reason": "<1-2 sentences>"}\n'
+    "}"
+)
+
+_RATIONALE_MAX_LEN = 500
+
+
+def _truncate(text: str, max_len: int = _RATIONALE_MAX_LEN) -> str:
+    """Truncate text to max_len characters, appending '…' if clipped."""
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def normalize_claude_verdict(raw: dict[str, Any]) -> dict[str, Any]:
+    """Guarantee a well-typed, fully-populated verdict dict.
+
+    - Fills any missing top-level or nested keys with safe defaults.
+    - Coerces scores to int where possible; uses None on failure.
+    - Truncates rationale / reason strings to _RATIONALE_MAX_LEN chars.
+
+    Safe to call on both real parsed verdicts and the placeholder.
+    """
+
+    def _coerce_score(val: Any) -> int | None:
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return None
+
+    def _coerce_str(val: Any) -> str:
+        s = val.strip() if isinstance(val, str) else ""
+        return _truncate(s)
+
+    tf_raw = raw.get("technical_founder") or {}
+    ap_raw = raw.get("accelerator_partner") or {}
+    fv_raw = raw.get("final_verdict") or {}
+
+    return {
+        "technical_founder": {
+            "score": _coerce_score(tf_raw.get("score")),
+            "rationale": _coerce_str(tf_raw.get("rationale")),
+        },
+        "accelerator_partner": {
+            "score": _coerce_score(ap_raw.get("score")),
+            "rationale": _coerce_str(ap_raw.get("rationale")),
+        },
+        "final_verdict": {
+            "score": _coerce_score(fv_raw.get("score")),
+            "label": str(fv_raw.get("label") or "unknown").strip(),
+            "reason": _coerce_str(fv_raw.get("reason")),
+        },
+    }
+
+
+def _paper_context(paper: Paper, openai_score: dict[str, Any]) -> str:
+    return (
+        f"Paper to evaluate:\n"
+        f"Title: {paper.title}\n"
+        f"URL: {paper.url}\n"
+        f"Abstract: {paper.abstract or 'Not available.'}\n\n"
+        f"OpenAI preliminary scores:\n{json.dumps(openai_score, indent=2)}"
+    )
+
 
 def debate_paper_with_two_agents(
     paper: Paper, openai_score: dict[str, Any]
 ) -> dict[str, Any]:
-    """Run a two-agent Claude debate and return a structured verdict.
+    """Run a true two-agent Claude debate and return a normalized verdict dict.
 
-    Gracefully returns a placeholder dict if ANTHROPIC_API_KEY is not set
-    so the pipeline continues without Claude configured.
+    Makes two sequential API calls — one per agent — so each agent responds
+    independently. Gracefully returns a placeholder dict if ANTHROPIC_API_KEY
+    is not set so the pipeline continues without Claude configured.
+
+    The returned dict always has the full structure guaranteed by
+    normalize_claude_verdict (all keys present, scores are int | None).
     """
     if not os.getenv("ANTHROPIC_API_KEY"):
         LOGGER.warning(
             "Claude debate skipped for paper_id=%s: no ANTHROPIC_API_KEY configured.",
             paper.paper_id,
         )
-        return dict(_PLACEHOLDER_VERDICT)
+        return normalize_claude_verdict(dict(_PLACEHOLDER_VERDICT))
 
     from anthropic_client import claude_chat  # noqa: PLC0415 — lazy import
 
-    user_content = f"""Paper to evaluate:
-Title: {paper.title}
-URL: {paper.url}
-Abstract: {paper.abstract or "Not available."}
-
-OpenAI preliminary scores:
-{json.dumps(openai_score, indent=2)}
-
-Two experts will now evaluate this paper as a startup opportunity:
-
-Agent 1 — Technical Founder / Staff Research Engineer:
-  Focuses on technical feasibility, novelty, and defensible technical moat.
-
-Agent 2 — Deep-Tech Accelerator Partner:
-  Focuses on market pull, accelerator story, and fundability.
-
-Each agent gives:
-  - A score (int 1–5, where 5 = extremely strong)
-  - A 1–2 sentence rationale
-
-They then briefly converge on a final verdict (score + label + reason).
-
-Required JSON output (fill in integer scores and short strings):
-{_VERDICT_SCHEMA}
-
-Output ONLY the JSON object. No prose before or after."""
-
-    messages = [
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
+    context = _paper_context(paper, openai_score)
 
     last_error: Exception | None = None
     for attempt in range(1, 3):
         try:
-            raw = claude_chat(messages, max_tokens=512)
-            verdict = _parse_verdict(raw)
+            # Call 1 — Technical Founder
+            tf_messages = [
+                {"role": "system", "content": _TF_SYSTEM},
+                {"role": "user", "content": context},
+            ]
+            raw_tf = claude_chat(tf_messages, max_tokens=256)
+            tf_result = _parse_agent_response(raw_tf, required_keys={"score", "rationale"})
             LOGGER.info(
-                "Claude debate succeeded for paper_id=%s: label=%s score=%s",
+                "TF agent done for paper_id=%s: score=%s",
                 paper.paper_id,
-                verdict.get("final_verdict", {}).get("label"),
-                verdict.get("final_verdict", {}).get("score"),
+                tf_result.get("score"),
             )
-            return verdict
+
+            # Call 2 — Accelerator Partner (sees TF's view)
+            ap_user = (
+                f"{context}\n\n"
+                f"Technical Founder's assessment:\n{json.dumps(tf_result, indent=2)}"
+            )
+            ap_messages = [
+                {"role": "system", "content": _AP_SYSTEM},
+                {"role": "user", "content": ap_user},
+            ]
+            raw_ap = claude_chat(ap_messages, max_tokens=512)
+            ap_result = _parse_agent_response(
+                raw_ap, required_keys={"accelerator_partner", "final_verdict"}
+            )
+            LOGGER.info(
+                "AP agent done for paper_id=%s: label=%s score=%s",
+                paper.paper_id,
+                ap_result.get("final_verdict", {}).get("label"),
+                ap_result.get("final_verdict", {}).get("score"),
+            )
+
+            raw_verdict: dict[str, Any] = {
+                "technical_founder": tf_result,
+                "accelerator_partner": ap_result["accelerator_partner"],
+                "final_verdict": ap_result["final_verdict"],
+            }
+            return normalize_claude_verdict(raw_verdict)
+
         except Exception as exc:
             last_error = exc
             LOGGER.warning(
@@ -124,24 +190,29 @@ Output ONLY the JSON object. No prose before or after."""
     LOGGER.error(
         "Claude debate ultimately failed for paper_id=%s: %s", paper.paper_id, last_error
     )
-    return dict(_PLACEHOLDER_VERDICT)
+    return normalize_claude_verdict(dict(_PLACEHOLDER_VERDICT))
 
 
-def _parse_verdict(content: str) -> dict[str, Any]:
-    """Parse Claude's JSON verdict; falls back to scanning for first { block."""
+def _parse_agent_response(content: str, required_keys: set[str]) -> dict[str, Any]:
+    """Parse a Claude agent's JSON response; falls back to scanning for first { block."""
     try:
         parsed = json.loads(content)
     except JSONDecodeError:
         parsed = _extract_first_json_object(content)
 
     if not isinstance(parsed, dict):
-        raise RuntimeError("Expected JSON object from Claude verdict")
+        raise RuntimeError("Expected JSON object from Claude agent response")
 
-    missing = _REQUIRED_VERDICT_KEYS - parsed.keys()
+    missing = required_keys - parsed.keys()
     if missing:
-        raise RuntimeError(f"Claude verdict missing required keys: {missing}")
+        raise RuntimeError(f"Claude agent response missing required keys: {missing}")
 
     return parsed
+
+
+def _parse_verdict(content: str) -> dict[str, Any]:
+    """Parse a full verdict JSON; used in unit tests and legacy callers."""
+    return _parse_agent_response(content, required_keys=_REQUIRED_VERDICT_KEYS)
 
 
 def _extract_first_json_object(content: str) -> dict[str, Any]:

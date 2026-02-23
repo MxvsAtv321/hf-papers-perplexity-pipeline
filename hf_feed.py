@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import requests
@@ -16,44 +16,75 @@ from models import Paper
 HF_DAILY_PAPERS_API_URL = "https://huggingface.co/api/daily_papers"
 REQUEST_TIMEOUT_SECONDS = 20
 _DEFAULT_MAX_AGE_DAYS = 180
+_DEFAULT_FETCH_DAYS = 7
 
 
 def fetch_papers(limit: int | None = None, max_age_days: int | None = None) -> list[Paper]:
     """Fetch and normalize papers from Hugging Face Daily Papers.
 
+    Fetches from the past HF_FETCH_DAYS days (default 7) by iterating over
+    ?date=YYYY-MM-DD query parameters, then deduplicates, age-filters, and
+    applies the limit.
+
     Args:
         limit: Optional max number of papers to return after age filtering.
         max_age_days: Max age in days for recency filtering. Reads HF_MAX_AGE_DAYS
-            env var if not supplied; defaults to 90.
+            env var if not supplied; defaults to 180.
     """
     if max_age_days is None:
         max_age_days = int(os.environ.get("HF_MAX_AGE_DAYS", _DEFAULT_MAX_AGE_DAYS))
 
-    try:
-        response = requests.get(
-            HF_DAILY_PAPERS_API_URL,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Failed to fetch Hugging Face papers: {exc}") from exc
+    fetch_days = int(os.environ.get("HF_FETCH_DAYS", _DEFAULT_FETCH_DAYS))
+    today = datetime.now(UTC).date()
 
-    payload = response.json()
-    papers = _parse_papers_payload(payload)
+    papers_by_id: dict[str, Paper] = {}
+
+    for days_ago in range(fetch_days):
+        fetch_date: date = today - timedelta(days=days_ago)
+        url = f"{HF_DAILY_PAPERS_API_URL}?date={fetch_date.isoformat()}"
+
+        try:
+            response = requests.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logging.warning(
+                "HF fetch: failed for date=%s, skipping: %s", fetch_date, exc
+            )
+            continue
+
+        day_papers = _parse_papers_payload(response.json())
+        new_ids = 0
+        for paper in day_papers:
+            if paper.paper_id not in papers_by_id:
+                papers_by_id[paper.paper_id] = paper
+                new_ids += 1
+
+        logging.info(
+            "HF fetch: date=%s raw_count=%s new_unique=%s",
+            fetch_date,
+            len(day_papers),
+            new_ids,
+        )
+
+    papers = list(papers_by_id.values())
     raw_count = len(papers)
 
     cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
     papers = [paper for paper in papers if paper.published_at >= cutoff]
     filtered_count = len(papers)
 
+    papers.sort(key=lambda p: p.published_at, reverse=True)
+
     if limit is not None:
         papers = papers[:limit]
 
     logging.info(
-        "HF fetch: raw_count=%s, after_age_filter=%s, max_age_days=%s, limit=%s, returned=%s",
+        "HF fetch: raw_count=%s, after_age_filter=%s, max_age_days=%s, "
+        "fetch_days=%s, limit=%s, returned=%s",
         raw_count,
         filtered_count,
         max_age_days,
+        fetch_days,
         limit,
         len(papers),
     )

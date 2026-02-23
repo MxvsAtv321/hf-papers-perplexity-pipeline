@@ -5,7 +5,7 @@ Daily pipeline that:
 1. Fetches recent papers from Hugging Face Daily Papers.
 2. Applies a heuristic pre-filter to drop low-signal papers (benchmarks, surveys, datasets).
 3. Sends each surviving paper to OpenAI for a cheap 5-dimension startup score.
-4. Runs high-scoring papers through a two-agent Claude debate (Technical Founder vs. Accelerator Partner).
+4. Runs commercially-viable high-scoring papers through a true two-agent Claude debate (Technical Founder call, then Accelerator Partner call with the founder's view).
 5. Saves full results to a local **CSV file** (`papers_pipeline.csv` by default).
 
 Idempotency is enforced by checking `paper_id` in the CSV before any API work.
@@ -46,7 +46,8 @@ Idempotency is enforced by checking `paper_id` in the CSV before any API work.
    - Optional: `CLAUDE_MODEL` (default `claude-opus-4-6`)
    - Optional: `CSV_OUTPUT_PATH` (default `papers_pipeline.csv`)
    - Optional: `HF_MAX_AGE_DAYS` (default `180`) — how far back to fetch HF papers
-   - Optional: `AGENTIC_MIN_OVERALL_SCORE` (default `4`) — minimum OpenAI score to trigger debate
+   - Optional: `HF_FETCH_DAYS` (default `7`) — how many past days to fetch (~50 papers/day, deduplicated)
+   - Optional: `AGENTIC_MIN_OVERALL_SCORE` (default `4`) — minimum overall score to trigger debate (also requires startup_potential >= 4 OR market_pull >= 4)
 
 ### Getting API keys
 
@@ -77,9 +78,10 @@ Stage 2 — OpenAI startup scoring (llm_client.score_paper_for_startup)
   │  Model: gpt-5.2 (configurable via OPENAI_MODEL)
   ▼
 Stage 3 — Claude two-agent debate (claude_agentic.debate_paper_with_two_agents)
-  │  Triggered only when overall_score >= AGENTIC_MIN_OVERALL_SCORE
-  │  Agent 1: Technical Founder — novelty, feasibility, technical moat
-  │  Agent 2: Deep-Tech Accelerator Partner — market pull, fundability
+  │  Gate: overall_score >= AGENTIC_MIN_OVERALL_SCORE (default 4)
+  │        AND (startup_potential >= 4 OR market_pull >= 4)
+  │  Call 1: Technical Founder — novelty, feasibility, technical moat
+  │  Call 2: Accelerator Partner — reads founder's view, gives own score + final verdict
   │  Skipped gracefully if ANTHROPIC_API_KEY is not set
   ▼
 Stage 4 — OpenAI deep analysis (llm_client.analyze_paper)
@@ -102,6 +104,19 @@ Results are written to a local CSV file (default: `papers_pipeline.csv` in the p
 | `abstract` | Paper abstract |
 | `published_at` | Publication timestamp |
 | `created_at` | Timestamp when the row was written |
+
+### Stage tracking columns
+
+Every row records which pipeline stages were executed for that paper.
+
+| Column | Description |
+|---|---|
+| `stage1_passed` | `True` — survived date window + heuristic pre-filter (always True for any written row) |
+| `stage2_scored` | `True` — OpenAI startup scoring completed |
+| `stage3_debated` | `True` — Claude debate gate passed and debate was invoked; `False` if overall score or commercial signal too weak |
+| `stage4_analyzed` | `True` — deep OpenAI triage completed (always True for any written row) |
+
+The most informative flag is `stage3_debated`. A `False` there means the paper scored below the debate threshold (`overall_score < AGENTIC_MIN_OVERALL_SCORE` or both `startup_potential < 4` and `market_pull < 4`).
 
 ### Stage 4 — Deep analysis columns
 
@@ -132,15 +147,24 @@ Results are written to a local CSV file (default: `papers_pipeline.csv` in the p
 
 ### Stage 3 — Claude debate columns
 
+The two agents evaluate independently. Reading them side by side shows *where* they agreed and *where* they diverged.
+
 | Column | Description |
 |---|---|
-| `claude_technical_founder_score` | Technical Founder agent score (1–5) |
-| `claude_technical_founder_rationale` | Technical Founder rationale |
-| `claude_accelerator_partner_score` | Accelerator Partner agent score (1–5) |
-| `claude_accelerator_partner_rationale` | Accelerator Partner rationale |
+| `claude_tf_score` | Technical Founder score (1–5) — weights technical novelty, feasibility, moat |
+| `claude_tf_rationale` | Technical Founder 1–2 sentence rationale (≤400 chars) |
+| `claude_ap_score` | Accelerator Partner score (1–5) — weights market pull, fundability, story |
+| `claude_ap_rationale` | Accelerator Partner rationale (≤400 chars) |
 | `claude_final_score` | Converged final score (1–5) |
-| `claude_final_label` | `keep`, `maybe`, or `drop` |
-| `claude_final_reason` | Final verdict reason |
+| `claude_final_label` | `keep`, `maybe`, `drop`, or `unknown` (unknown = debate not configured or failed) |
+| `claude_final_reason` | Final verdict reason (≤400 chars) |
+| `claude_score_gap` | `\|TF score − AP score\|`; empty when either agent's score is None |
+| `claude_disagreement_flag` | `True` when gap ≥ 2 **or** one agent scored ≥ 4 while the other scored ≤ 2 |
+| `claude_verdict_raw` | Full JSON verdict for programmatic access |
+
+**How to use `claude_disagreement_flag`:** Filter for `True` to find papers where the two agents saw the world differently — these are often the most interesting investment decisions, where a technical insight (TF) conflicts with a market read (AP).
+
+**Empty Claude columns** on a row mean `stage3_debated = False` — the paper didn't pass the dual-condition debate gate and no Claude calls were made.
 
 To configure a different output path:
 

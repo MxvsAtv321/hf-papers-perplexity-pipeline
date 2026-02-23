@@ -28,11 +28,11 @@ pytest tests/test_claude_agentic.py
 
 The pipeline runs in five sequential stages orchestrated by `main.py`:
 
-1. **Fetch** (`hf_feed.fetch_papers`) — Calls the official HF Daily Papers JSON API (`/api/daily_papers`), filters by `max_age_days` (default 180, overridden by `HF_MAX_AGE_DAYS` env var), and normalizes results into `Paper` dataclass instances.
+1. **Fetch** (`hf_feed.fetch_papers`) — Fetches the HF Daily Papers API for each of the past `HF_FETCH_DAYS` days (default 7, ~50 papers/day), deduplicates by `paper_id`, then filters by `max_age_days` (default 180, overridden by `HF_MAX_AGE_DAYS` env var), and normalizes results into `Paper` dataclass instances.
 2. **Heuristic filter** (`filters.is_potential_startup_paper`) — Keyword-based pre-filter; drops papers that are purely benchmarks, surveys, or dataset releases with no high-value signal. No LLM calls.
 3. **Deduplicate** (`csv_sink.paper_already_exists`) — Scans the CSV output file for an existing row with the same `paper_id` before any API work.
 4. **Score** (`llm_client.score_paper_for_startup`) — Cheap OpenAI pass: 5 integer scores (startup_potential, market_pull, technical_moat, story_for_accelerator, overall_score) + rationale. Uses `max_tokens=256`.
-5. **Debate** (`claude_agentic.debate_paper_with_two_agents`) — Two-agent Claude debate triggered only when `overall_score >= AGENTIC_MIN_OVERALL_SCORE` (default 4). Agent 1 is a Technical Founder, Agent 2 is a Deep-Tech Accelerator Partner. Skipped gracefully if `ANTHROPIC_API_KEY` is not set.
+5. **Debate** (`claude_agentic.debate_paper_with_two_agents`) — True two-agent Claude debate: two sequential API calls (Technical Founder, then Accelerator Partner who reads the founder's view). Gated by `_should_run_debate()`: requires `overall_score >= AGENTIC_MIN_OVERALL_SCORE` (default 4) **and** `startup_potential >= 4` OR `market_pull >= 4`. Skipped gracefully if `ANTHROPIC_API_KEY` is not set.
 6. **Enrich** (`llm_client.analyze_paper`) — Full OpenAI structured triage: summary, capability, product angles, competition, top bets.
 7. **Persist** (`csv_sink.write_paper_entry`) — Appends a flattened row to a local CSV file (default `papers_pipeline.csv`).
 
@@ -59,7 +59,11 @@ HF API → heuristic filter → CSV dedup → OpenAI score → Claude debate →
 
 ### CSV column mapping
 
-`csv_sink.write_paper_entry` flattens the Paper fields, OpenAI score, Claude debate, and OpenAI analysis into a single CSV row. Complex list fields (`product_angles`, `competition`, `top_bets`) are stored as JSON-serialized strings. Score and debate columns default to empty string when not provided.
+`csv_sink.write_paper_entry` flattens the Paper fields, stage flags, OpenAI score, Claude debate, and OpenAI analysis into a single CSV row. Complex list fields (`product_angles`, `competition`, `top_bets`) are stored as JSON-serialized strings. Score, debate, and stage columns default to empty string / False when not provided.
+
+Stage flags: `stage1_passed`, `stage2_scored`, `stage3_debated`, `stage4_analyzed` (written as `True`/`False` strings).
+
+Claude columns: `claude_tf_score`, `claude_tf_rationale`, `claude_ap_score`, `claude_ap_rationale`, `claude_final_score`, `claude_final_label`, `claude_final_reason`, `claude_score_gap`, `claude_disagreement_flag`, `claude_verdict_raw`.
 
 ### Environment variables
 
@@ -70,6 +74,7 @@ HF API → heuristic filter → CSV dedup → OpenAI score → Claude debate →
 | `OPENAI_TEMPERATURE` | No | `0.1` | import time |
 | `CSV_OUTPUT_PATH` | No | `papers_pipeline.csv` | import time |
 | `HF_MAX_AGE_DAYS` | No | `180` | call time |
+| `HF_FETCH_DAYS` | No | `7` | call time |
 | `ANTHROPIC_API_KEY` | No | — | call time |
 | `CLAUDE_MODEL` | No | `claude-opus-4-6` | call time |
 | `AGENTIC_MIN_OVERALL_SCORE` | No | `4` | call time |
@@ -80,8 +85,8 @@ HF API → heuristic filter → CSV dedup → OpenAI score → Claude debate →
 
 Tests live in `tests/` and use `conftest.py` to add the repo root to `sys.path`. Tests are unit-level only — no real HTTP calls, no real API calls:
 
-- `test_hf_feed.py` — tests `_parse_papers_payload` and age-filtering in `fetch_papers` (mocked HTTP).
+- `test_hf_feed.py` — tests `_parse_papers_payload`, age-filtering, multi-date dedup, per-date error resilience, and `HF_FETCH_DAYS` request count (mocked HTTP).
 - `test_filters.py` — parametrized tests for `is_potential_startup_paper` across 18 cases.
 - `test_llm_client.py` — tests `_parse_analysis_json`, `validate_analysis_schema`, and `score_paper_for_startup` (mocked OpenAI).
 - `test_csv_sink.py` — tests `write_paper_entry` and `paper_already_exists` using `tmp_path`, no real filesystem side effects.
-- `test_claude_agentic.py` — tests `debate_paper_with_two_agents` (no-key placeholder, mocked Claude response, failure fallback) and `_parse_verdict` unit tests.
+- `test_claude_agentic.py` — tests `debate_paper_with_two_agents` (no-key placeholder, two sequential mocked calls, TF view passed to AP, retry on failure, failure fallback) and `_parse_verdict` unit tests.
