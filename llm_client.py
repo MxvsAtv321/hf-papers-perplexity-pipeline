@@ -173,7 +173,7 @@ def _extract_first_json_object(content: str) -> dict[str, Any]:
 def score_paper_for_startup(paper: Paper) -> dict[str, Any]:
     """Cheap Stage-2 scoring pass: returns 5 integer scores + rationale.
 
-    Uses a low max_tokens budget to keep costs minimal. Raises RuntimeError
+    Uses a low max_completion_tokens budget to keep costs minimal. Raises RuntimeError
     if the API call or JSON parse fails on both attempts.
     """
     api_key = os.getenv("OPENAI_API_KEY")
@@ -194,7 +194,7 @@ def score_paper_for_startup(paper: Paper) -> dict[str, Any]:
             response = client.chat.completions.create(
                 model=OPENAI_MODEL,
                 temperature=OPENAI_TEMPERATURE,
-                max_tokens=256,
+                max_completion_tokens=256,
                 response_format={"type": "json_object"},
                 messages=[
                     {"role": "system", "content": _SCORE_SYSTEM_PROMPT},
