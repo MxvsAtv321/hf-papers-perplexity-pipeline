@@ -98,6 +98,37 @@ def test_paper_already_exists_false_for_different_id() -> None:
     assert csv_sink.paper_already_exists(other) is False
 
 
+def test_write_paper_entry_with_score_populates_score_columns() -> None:
+    score = {
+        "startup_potential": 4,
+        "market_pull": 3,
+        "technical_moat": 5,
+        "story_for_accelerator": 4,
+        "overall_score": 4,
+        "rationale": "Strong technical moat.",
+    }
+    csv_sink.write_paper_entry(SAMPLE_PAPER, SAMPLE_ANALYSIS, score=score)
+
+    path = Path(csv_sink.CSV_OUTPUT_PATH)
+    with path.open(newline="", encoding="utf-8") as fh:
+        row = next(csv.DictReader(fh))
+
+    assert row["startup_potential"] == "4"
+    assert row["overall_score"] == "4"
+    assert row["score_rationale"] == "Strong technical moat."
+
+
+def test_write_paper_entry_without_score_leaves_score_columns_empty() -> None:
+    csv_sink.write_paper_entry(SAMPLE_PAPER, SAMPLE_ANALYSIS)
+
+    path = Path(csv_sink.CSV_OUTPUT_PATH)
+    with path.open(newline="", encoding="utf-8") as fh:
+        row = next(csv.DictReader(fh))
+
+    assert row["overall_score"] == ""
+    assert row["score_rationale"] == ""
+
+
 def test_write_paper_entry_appends_multiple_rows() -> None:
     csv_sink.write_paper_entry(SAMPLE_PAPER, SAMPLE_ANALYSIS)
 

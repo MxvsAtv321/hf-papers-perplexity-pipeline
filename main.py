@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 
 from dotenv import load_dotenv
 
 from csv_sink import paper_already_exists, write_paper_entry
 from filters import is_potential_startup_paper
 from hf_feed import fetch_papers
-from llm_client import analyze_paper
+from llm_client import analyze_paper, score_paper_for_startup
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,8 +57,20 @@ def run(limit: int | None, dry_run: bool) -> None:
             continue
 
         try:
+            # Stage 2: cheap OpenAI scoring
+            score = score_paper_for_startup(paper)
+
+            # Stage 3: Claude debate — only for high-scoring papers
+            min_score = int(os.getenv("AGENTIC_MIN_OVERALL_SCORE", "4"))
+            debate: dict | None = None
+            overall = score.get("overall_score")
+            if isinstance(overall, int) and overall >= min_score:
+                from claude_agentic import debate_paper_with_two_agents  # noqa: PLC0415
+                debate = debate_paper_with_two_agents(paper, score)
+
+            # Full OpenAI analysis (existing)
             analysis = analyze_paper(paper)
-            write_paper_entry(paper, analysis)
+            write_paper_entry(paper, analysis, score=score, debate=debate)
             processed += 1
             logging.info("Wrote CSV entry for paper_id=%s", paper.paper_id)
         except Exception as exc:  # broad by design to keep daily run resilient

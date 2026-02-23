@@ -22,6 +22,22 @@ CSV_COLUMNS = [
     "url",
     "abstract",
     "published_at",
+    # Stage 2 — OpenAI startup scores
+    "startup_potential",
+    "market_pull",
+    "technical_moat",
+    "story_for_accelerator",
+    "overall_score",
+    "score_rationale",
+    # Stage 3 — Claude two-agent debate
+    "claude_technical_founder_score",
+    "claude_technical_founder_rationale",
+    "claude_accelerator_partner_score",
+    "claude_accelerator_partner_rationale",
+    "claude_final_score",
+    "claude_final_label",
+    "claude_final_reason",
+    # Full OpenAI analysis
     "summary_problem",
     "summary_core_method",
     "summary_key_technical_idea",
@@ -51,13 +67,31 @@ def paper_already_exists(paper: Paper) -> bool:
     return False
 
 
-def write_paper_entry(paper: Paper, analysis: dict[str, Any]) -> None:
-    """Append a row to the CSV (creating it with a header if needed)."""
+def write_paper_entry(
+    paper: Paper,
+    analysis: dict[str, Any],
+    score: dict[str, Any] | None = None,
+    debate: dict[str, Any] | None = None,
+) -> None:
+    """Append a row to the CSV (creating it with a header if needed).
+
+    Args:
+        paper:    Normalized paper record.
+        analysis: Full OpenAI analysis dict (summary, product_angles, etc.).
+        score:    Optional Stage-2 OpenAI scoring dict.
+        debate:   Optional Stage-3 Claude debate verdict dict.
+    """
     path = Path(CSV_OUTPUT_PATH)
     write_header = not path.exists() or path.stat().st_size == 0
 
     summary = analysis.get("summary", {}) if isinstance(analysis.get("summary"), dict) else {}
     capability = analysis.get("capability", {}) if isinstance(analysis.get("capability"), dict) else {}
+
+    score = score or {}
+    debate = debate or {}
+    tf = debate.get("technical_founder") or {}
+    ap = debate.get("accelerator_partner") or {}
+    fv = debate.get("final_verdict") or {}
 
     row = {
         "paper_id": paper.paper_id,
@@ -65,6 +99,22 @@ def write_paper_entry(paper: Paper, analysis: dict[str, Any]) -> None:
         "url": paper.url,
         "abstract": paper.abstract or "",
         "published_at": paper.published_at.isoformat(),
+        # Stage 2 scores
+        "startup_potential": score.get("startup_potential", ""),
+        "market_pull": score.get("market_pull", ""),
+        "technical_moat": score.get("technical_moat", ""),
+        "story_for_accelerator": score.get("story_for_accelerator", ""),
+        "overall_score": score.get("overall_score", ""),
+        "score_rationale": _as_text(score.get("rationale")),
+        # Stage 3 Claude debate
+        "claude_technical_founder_score": tf.get("score", ""),
+        "claude_technical_founder_rationale": _as_text(tf.get("rationale")),
+        "claude_accelerator_partner_score": ap.get("score", ""),
+        "claude_accelerator_partner_rationale": _as_text(ap.get("rationale")),
+        "claude_final_score": fv.get("score", ""),
+        "claude_final_label": _as_text(fv.get("label")),
+        "claude_final_reason": _as_text(fv.get("reason")),
+        # Full OpenAI analysis
         "summary_problem": _as_text(summary.get("problem")),
         "summary_core_method": _as_text(summary.get("core_method")),
         "summary_key_technical_idea": _as_text(summary.get("key_technical_idea")),
