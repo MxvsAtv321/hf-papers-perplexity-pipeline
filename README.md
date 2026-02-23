@@ -3,16 +3,15 @@
 Daily pipeline that:
 
 1. Fetches recent papers from Hugging Face Daily Papers.
-2. Sends each new paper to Perplexity for structured triage.
-3. Saves results to a Notion database called **Deep-Tech Idea Pipeline**.
+2. Sends each new paper to OpenAI GPT for structured triage.
+3. Saves results to a local **CSV file** (`papers_pipeline.csv` by default).
 
-Idempotency is enforced by checking `Paper ID` in Notion before insert.
+Idempotency is enforced by checking `paper_id` in the CSV before insert.
 
 ## Requirements
 
 - Python 3.11+
-- Perplexity API key
-- Notion integration token + database ID
+- OpenAI API key
 
 ## Setup
 
@@ -37,35 +36,50 @@ Idempotency is enforced by checking `Paper ID` in Notion before insert.
 
 4. Fill values in `.env`:
 
-   - `PERPLEXITY_API_KEY`
-   - `NOTION_API_KEY`
-   - `NOTION_DATABASE_ID`
-   - Optional: `PERPLEXITY_MODEL`, `PERPLEXITY_TEMPERATURE`
+   - `OPENAI_API_KEY` — your OpenAI API key (required)
+   - Optional: `OPENAI_MODEL` (default `gpt-5.2`)
+   - Optional: `OPENAI_TEMPERATURE` (default `0.1`)
+   - Optional: `CSV_OUTPUT_PATH` (default `papers_pipeline.csv`)
 
-## Create Notion Database
+### Getting an OpenAI API key
 
-Create a Notion database named **Deep-Tech Idea Pipeline** with these properties:
+1. Go to [platform.openai.com](https://platform.openai.com) and sign in.
+2. Navigate to **API keys** in the left sidebar and click **Create new secret key**.
+3. Copy the key and paste it as `OPENAI_API_KEY` in your `.env` file.
 
-- `Paper ID` (Rich text)
-- `Title` (Title)
-- `URL` (URL)
-- `Abstract` (Rich text)
-- `Summary - Problem` (Rich text)
-- `Summary - Core Method` (Rich text)
-- `Summary - Key Idea` (Rich text)
-- `Capability` (Rich text)
-- `Product Angles` (Rich text)
-- `Top Bets` (Rich text)
-- `Created At` (Date)
-- `Status` (Select) with option `Exploring`
+## CSV Output
 
-Also share the database with your Notion integration/token.
+Results are written to a local CSV file (default: `papers_pipeline.csv` in the project root).
 
-### How to find `NOTION_DATABASE_ID`
+Each row contains:
 
-- Open the database in Notion.
-- From the URL, copy the 32-character ID part between the last `/` and `?v=...`.
-- You can keep or remove dashes; both formats are accepted.
+| Column | Description |
+|---|---|
+| `paper_id` | HuggingFace paper ID |
+| `title` | Paper title |
+| `url` | Paper URL |
+| `abstract` | Paper abstract |
+| `published_at` | Publication timestamp |
+| `summary_problem` | Problem the paper addresses |
+| `summary_core_method` | Core method used |
+| `summary_key_technical_idea` | Key technical idea |
+| `summary_inputs_outputs` | Inputs and outputs |
+| `summary_data_assumptions` | Data and assumptions |
+| `summary_metrics_and_baselines` | Metrics and baselines |
+| `summary_limitations` | Limitations |
+| `capability_plain_language_capability` | Plain-language capability description |
+| `product_angles` | JSON array of product angle objects |
+| `competition` | JSON array of competitor objects |
+| `top_bets` | JSON array of top bet objects |
+| `created_at` | Timestamp when the row was written |
+
+To configure a different output path:
+
+```bash
+CSV_OUTPUT_PATH=/path/to/my_output.csv
+```
+
+To open in Excel or Google Sheets, just open the CSV file directly — both apps handle UTF-8 CSV natively.
 
 ## Run
 
@@ -76,7 +90,7 @@ python main.py --limit 10
 CLI options:
 
 - `--limit N`: max number of recent papers to process.
-- `--dry-run`: prints what would be processed, skips Perplexity and Notion writes.
+- `--dry-run`: prints what would be processed, skips OpenAI and CSV writes.
 
 ## Scheduling
 
@@ -112,9 +126,7 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run pipeline
         env:
-          PERPLEXITY_API_KEY: ${{ secrets.PERPLEXITY_API_KEY }}
-          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python main.py --limit 20
 ```
 

@@ -1,4 +1,4 @@
-"""Perplexity API client for paper triage and startup-angle analysis."""
+"""OpenAI GPT-based LLM client for paper analysis."""
 
 from __future__ import annotations
 
@@ -8,14 +8,12 @@ import os
 from json import JSONDecodeError
 from typing import Any
 
-import requests
+from openai import OpenAI
 
 from models import Paper
 
-PERPLEXITY_API_URL = "https://api.perplexity.ai/chat/completions"
-PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "sonar-pro")
-PERPLEXITY_TEMPERATURE = float(os.getenv("PERPLEXITY_TEMPERATURE", "0.1"))
-REQUEST_TIMEOUT_SECONDS = 60
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
 MAX_ATTEMPTS = 2
 
 LOGGER = logging.getLogger(__name__)
@@ -68,68 +66,58 @@ Required JSON schema:
 
 
 def analyze_paper(paper: Paper) -> dict[str, Any]:
-    """Analyze one paper with Perplexity and return structured JSON."""
-    api_key = os.getenv("PERPLEXITY_API_KEY")
+    """Analyze one paper with OpenAI and return structured JSON."""
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError("PERPLEXITY_API_KEY environment variable is required")
+        raise RuntimeError("OPENAI_API_KEY environment variable is required")
 
-    LOGGER.info("Analyzing paper with Perplexity: %s", paper.title)
+    LOGGER.info("Analyzing paper with OpenAI: %s", paper.title)
     last_error: Exception | None = None
+
+    client = OpenAI(api_key=api_key)
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            content = _call_perplexity(api_key=api_key, paper=paper)
-            parsed = _parse_analysis_json(content)
+            parsed = _call_openai(client=client, paper=paper)
             if not validate_analysis_schema(parsed):
-                raise RuntimeError("Perplexity response JSON did not match required schema")
-            LOGGER.info("Perplexity analysis succeeded for paper_id=%s", paper.paper_id)
+                raise RuntimeError("OpenAI response JSON did not match required schema")
+            LOGGER.info("OpenAI analysis succeeded for paper_id=%s", paper.paper_id)
             return parsed
-        except Exception as exc:  # broad to preserve graceful retry path
+        except Exception as exc:
             last_error = exc
             LOGGER.warning(
-                "Perplexity analysis failed for paper_id=%s on attempt %s/%s: %s",
+                "OpenAI analysis failed for paper_id=%s on attempt %s/%s: %s",
                 paper.paper_id,
                 attempt,
                 MAX_ATTEMPTS,
                 exc,
             )
 
-    raise RuntimeError(f"Perplexity analysis failed for paper_id={paper.paper_id}: {last_error}")
+    raise RuntimeError(f"OpenAI analysis failed for paper_id={paper.paper_id}: {last_error}")
 
 
-def _call_perplexity(api_key: str, paper: Paper) -> str:
+def _call_openai(client: OpenAI, paper: Paper) -> dict[str, Any]:
     user_prompt = (
         f"Title: {paper.title}\n"
         f"URL: {paper.url}\n"
         f"Abstract: {paper.abstract or 'Not available.'}\n"
     )
 
-    payload = {
-        "model": PERPLEXITY_MODEL,
-        "temperature": PERPLEXITY_TEMPERATURE,
-        "messages": [
+    response = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=OPENAI_TEMPERATURE,
+        response_format={"type": "json_object"},
+        messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-    response = requests.post(
-        PERPLEXITY_API_URL,
-        headers=headers,
-        json=payload,
-        timeout=REQUEST_TIMEOUT_SECONDS,
     )
-    response.raise_for_status()
-    body = response.json()
 
-    try:
-        return body["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(f"Unexpected Perplexity response shape: {body}") from exc
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError("OpenAI returned an empty response")
+
+    return _parse_analysis_json(content)
 
 
 def _parse_analysis_json(content: str) -> dict[str, Any]:
@@ -140,7 +128,7 @@ def _parse_analysis_json(content: str) -> dict[str, Any]:
         parsed = _extract_first_json_object(content)
 
     if not isinstance(parsed, dict):
-        raise RuntimeError("Expected JSON object from Perplexity response")
+        raise RuntimeError("Expected JSON object from OpenAI response")
     return parsed
 
 
@@ -156,7 +144,7 @@ def _extract_first_json_object(content: str) -> dict[str, Any]:
             continue
         if isinstance(candidate, dict):
             return candidate
-    raise RuntimeError("Could not extract valid JSON object from Perplexity output")
+    raise RuntimeError("Could not extract valid JSON object from OpenAI output")
 
 
 def validate_analysis_schema(data: dict[str, Any]) -> bool:

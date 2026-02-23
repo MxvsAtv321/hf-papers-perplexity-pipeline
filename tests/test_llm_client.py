@@ -1,0 +1,54 @@
+from llm_client import _parse_analysis_json, validate_analysis_schema
+
+
+def test_parse_analysis_json_with_wrapping_text() -> None:
+    wrapped = (
+        "Here is your result:\n"
+        '{"summary":{"problem":"","core_method":"","key_technical_idea":"","inputs_outputs":"",'
+        '"data_assumptions":"","metrics_and_baselines":"","limitations":""},'
+        '"capability":{"plain_language_capability":""},"product_angles":[],'
+        '"competition":[],"top_bets":[]}\n'
+        "Thanks!"
+    )
+
+    parsed = _parse_analysis_json(wrapped)
+    assert isinstance(parsed, dict)
+    assert validate_analysis_schema(parsed) is True
+
+
+def test_validate_analysis_schema_missing_top_key() -> None:
+    data = {
+        "summary": {
+            "problem": "",
+            "core_method": "",
+            "key_technical_idea": "",
+            "inputs_outputs": "",
+            "data_assumptions": "",
+            "metrics_and_baselines": "",
+            "limitations": "",
+        },
+        "capability": {"plain_language_capability": ""},
+        "product_angles": [],
+        # "competition" is missing
+        "top_bets": [],
+    }
+    assert validate_analysis_schema(data) is False
+
+
+def test_validate_analysis_schema_missing_summary_field() -> None:
+    data = {
+        "summary": {
+            "problem": "",
+            # "core_method" is missing
+            "key_technical_idea": "",
+            "inputs_outputs": "",
+            "data_assumptions": "",
+            "metrics_and_baselines": "",
+            "limitations": "",
+        },
+        "capability": {"plain_language_capability": ""},
+        "product_angles": [],
+        "competition": [],
+        "top_bets": [],
+    }
+    assert validate_analysis_schema(data) is False

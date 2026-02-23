@@ -7,9 +7,9 @@ import logging
 
 from dotenv import load_dotenv
 
+from csv_sink import paper_already_exists, write_paper_entry
 from hf_feed import fetch_papers
-from notion_client import create_paper_entry, paper_already_exists
-from perplexity_client import analyze_paper
+from llm_client import analyze_paper
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +35,7 @@ def run(limit: int | None, dry_run: bool) -> None:
 
     for paper in papers:
         logging.info("Evaluating paper: %s", paper.title)
-        if paper_already_exists(paper.paper_id):
+        if paper_already_exists(paper):
             skipped += 1
             logging.info("Skipping existing paper_id=%s", paper.paper_id)
             continue
@@ -47,9 +47,9 @@ def run(limit: int | None, dry_run: bool) -> None:
 
         try:
             analysis = analyze_paper(paper)
-            create_paper_entry(paper, analysis)
+            write_paper_entry(paper, analysis)
             processed += 1
-            logging.info("Created Notion entry for paper_id=%s", paper.paper_id)
+            logging.info("Wrote CSV entry for paper_id=%s", paper.paper_id)
         except Exception as exc:  # broad by design to keep daily run resilient
             failed += 1
             logging.exception("Failed processing paper_id=%s: %s", paper.paper_id, exc)
