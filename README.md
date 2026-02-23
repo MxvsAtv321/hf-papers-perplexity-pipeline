@@ -40,6 +40,7 @@ Idempotency is enforced by checking `paper_id` in the CSV before insert.
    - Optional: `OPENAI_MODEL` (default `gpt-5.2`)
    - Optional: `OPENAI_TEMPERATURE` (default `0.1`)
    - Optional: `CSV_OUTPUT_PATH` (default `papers_pipeline.csv`)
+   - Optional: `HF_MAX_AGE_DAYS` (default `90`) — how far back to fetch HF papers
 
 ### Getting an OpenAI API key
 

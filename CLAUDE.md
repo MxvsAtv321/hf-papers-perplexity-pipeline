@@ -26,7 +26,7 @@ pytest tests/test_csv_sink.py
 
 The pipeline runs in four sequential stages orchestrated by `main.py`:
 
-1. **Fetch** (`hf_feed.fetch_papers`) — Calls the official HF Daily Papers JSON API (`/api/daily_papers`), filters by `max_age_hours` (default 24h), and normalizes results into `Paper` dataclass instances.
+1. **Fetch** (`hf_feed.fetch_papers`) — Calls the official HF Daily Papers JSON API (`/api/daily_papers`), filters by `max_age_days` (default 90, overridden by `HF_MAX_AGE_DAYS` env var), and normalizes results into `Paper` dataclass instances.
 2. **Deduplicate** (`csv_sink.paper_already_exists`) — Scans the CSV output file for an existing row with the same `paper_id` before any API-expensive work.
 3. **Enrich** (`llm_client.analyze_paper`) — Sends each new paper to OpenAI (`gpt-5.2` by default) with a strict system prompt that demands a specific JSON schema. Uses `response_format={"type": "json_object"}` and has 2 retry attempts.
 4. **Persist** (`csv_sink.write_paper_entry`) — Appends a flattened row to a local CSV file (default `papers_pipeline.csv`).
@@ -51,12 +51,15 @@ HF API → [Paper] → CSV dedup check → OpenAI → CSV write
 | `OPENAI_MODEL` | No | `gpt-5.2` |
 | `OPENAI_TEMPERATURE` | No | `0.1` |
 | `CSV_OUTPUT_PATH` | No | `papers_pipeline.csv` |
+| `HF_MAX_AGE_DAYS` | No | `90` |
 
 `OPENAI_MODEL` and `OPENAI_TEMPERATURE` are read at module import time in `llm_client.py`, so `.env` must be loaded before import or set in the environment.
+
+`HF_MAX_AGE_DAYS` is read at call time inside `hf_feed.fetch_papers`, so it is safe to set it in `.env` (which `load_dotenv()` loads at the top of `main.py`).
 
 ### Tests
 
 Tests live in `tests/` and use `conftest.py` to add the repo root to `sys.path`. Tests are unit-level only:
-- `test_hf_feed.py` — tests `_parse_papers_payload` without real HTTP calls.
+- `test_hf_feed.py` — tests `_parse_papers_payload` and age-filtering in `fetch_papers` (via mocked HTTP) without real HTTP calls.
 - `test_llm_client.py` — tests `_parse_analysis_json` and `validate_analysis_schema` without real HTTP calls.
 - `test_csv_sink.py` — tests `write_paper_entry` and `paper_already_exists` using a `tmp_path` fixture, no real file system side effects.

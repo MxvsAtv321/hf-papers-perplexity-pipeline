@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -13,19 +15,23 @@ from models import Paper
 # It is preferred over HTML scraping and third-party feeds for stability.
 HF_DAILY_PAPERS_API_URL = "https://huggingface.co/api/daily_papers"
 REQUEST_TIMEOUT_SECONDS = 20
+_DEFAULT_MAX_AGE_DAYS = 90
 
 
-def fetch_papers(limit: int | None = None, max_age_hours: int | None = 24) -> list[Paper]:
+def fetch_papers(limit: int | None = None, max_age_days: int | None = None) -> list[Paper]:
     """Fetch and normalize papers from Hugging Face Daily Papers.
 
     Args:
-        limit: Optional max number of papers to return after filtering.
-        max_age_hours: Optional max age threshold in hours for recency filtering.
+        limit: Optional max number of papers to return after age filtering.
+        max_age_days: Max age in days for recency filtering. Reads HF_MAX_AGE_DAYS
+            env var if not supplied; defaults to 90.
     """
+    if max_age_days is None:
+        max_age_days = int(os.environ.get("HF_MAX_AGE_DAYS", _DEFAULT_MAX_AGE_DAYS))
+
     try:
         response = requests.get(
             HF_DAILY_PAPERS_API_URL,
-            params={"limit": limit} if limit else None,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
@@ -34,13 +40,23 @@ def fetch_papers(limit: int | None = None, max_age_hours: int | None = 24) -> li
 
     payload = response.json()
     papers = _parse_papers_payload(payload)
+    raw_count = len(papers)
 
-    if max_age_hours is not None:
-        cutoff = datetime.now(UTC) - timedelta(hours=max_age_hours)
-        papers = [paper for paper in papers if paper.published_at >= cutoff]
+    cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+    papers = [paper for paper in papers if paper.published_at >= cutoff]
+    filtered_count = len(papers)
 
     if limit is not None:
         papers = papers[:limit]
+
+    logging.info(
+        "HF fetch: raw_count=%s, after_age_filter=%s, max_age_days=%s, limit=%s, returned=%s",
+        raw_count,
+        filtered_count,
+        max_age_days,
+        limit,
+        len(papers),
+    )
 
     return papers
 
