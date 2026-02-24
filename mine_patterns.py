@@ -17,6 +17,9 @@ python mine_patterns.py --score-composites
 # Add plain-language simple_summary to each scored idea:
 python mine_patterns.py --add-simple-summaries
 
+# Generate cross-theme composite ideas (standalone):
+python mine_patterns.py --cross-theme-composites
+
 # Custom inputs:
 python mine_patterns.py --input papers_debated.csv papers_wide_scout.csv --min-score 4
 
@@ -38,6 +41,7 @@ from openai import OpenAI
 
 from pattern_miner import (
     COMPOSITES_CSV_COLUMNS,
+    CROSS_THEME_CSV_COLUMNS,
     SCORED_COMPOSITES_CSV_COLUMNS,
     SCORED_WITH_SUMMARY_CSV_COLUMNS,
     THEMES_CSV_COLUMNS,
@@ -48,15 +52,19 @@ from pattern_miner import (
     add_simple_summaries_to_composites,
     aggregate_paper_signals,
     build_composite_prompt,
+    build_cross_theme_prompt,
     build_scoring_prompt,
     build_simple_summary_prompt,
     build_theme_summary_prompt,
     composite_ideas_to_rows,
     extract_themes,
     find_composite_candidates,
+    generate_cross_theme_composites,
     load_composite_ideas,
     load_papers,
+    load_themes_from_csv,
     parse_composite_response,
+    parse_cross_theme_response,
     parse_score_response,
     parse_simple_summary_response,
     score_composite_ideas,
@@ -74,6 +82,8 @@ _DEFAULT_COMPOSITES_IN = "papers_composite_ideas.csv"
 _DEFAULT_SCORED_OUT = "papers_composite_scored.csv"
 _DEFAULT_SCORED_IN = "papers_composite_scored.csv"
 _DEFAULT_SCORED_WITH_SUMMARY_OUT = "papers_composite_scored_with_summary.csv"
+_DEFAULT_CROSS_THEME_OUT = "papers_cross_theme_scored_with_summary.csv"
+_DEFAULT_THEMES_IN = "papers_themes.csv"
 _OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 _OPENAI_TEMP = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
 
@@ -158,6 +168,16 @@ def parse_args() -> argparse.Namespace:
         "--scored-with-summary-out",
         default=_DEFAULT_SCORED_WITH_SUMMARY_OUT,
         help=f"Output path with simple_summary added (default: {_DEFAULT_SCORED_WITH_SUMMARY_OUT}).",
+    )
+    p.add_argument(
+        "--cross-theme-composites",
+        action="store_true",
+        help="Generate cross-theme composite startup ideas and write --cross-theme-out.",
+    )
+    p.add_argument(
+        "--cross-theme-out",
+        default=_DEFAULT_CROSS_THEME_OUT,
+        help=f"Output path for cross-theme results (default: {_DEFAULT_CROSS_THEME_OUT}).",
     )
     return p.parse_args()
 
@@ -277,6 +297,48 @@ def _run_score_composites(
     return scored
 
 
+def _run_cross_theme_composites(
+    cross_theme_out: str,
+    client: OpenAI,
+    input_csvs: list[str] | None = None,
+    themes_csv: str | None = None,
+    max_ideas: int = 8,
+) -> list[dict]:
+    """Load papers + themes, generate cross-theme composites, write output CSV.
+
+    Standalone — loads its own data from default paths.
+    """
+    input_csvs = input_csvs or _DEFAULT_INPUTS
+    themes_csv = themes_csv or _DEFAULT_THEMES_IN
+
+    papers = load_papers(input_csvs, min_score=1)
+    if not papers:
+        print("No papers loaded for cross-theme generation. Check input CSVs.")
+        return []
+
+    papers_by_id = {p.paper_id: p for p in papers}
+
+    # Prefer themes from saved CSV (they have LLM summaries); fall back to re-extracting
+    themes = load_themes_from_csv(themes_csv)
+    if not themes:
+        LOGGER.info("No themes CSV found — extracting themes from papers")
+        themes = extract_themes(papers)
+
+    def llm_fn(messages: list[dict]) -> str:
+        return _call_openai_json(client, messages, max_tokens=768)
+
+    print(f"\nGenerating up to {max_ideas} cross-theme composite ideas via OpenAI...")
+    rows = generate_cross_theme_composites(papers_by_id, themes, llm_fn, max_ideas=max_ideas)
+
+    if rows:
+        write_csv(cross_theme_out, CROSS_THEME_CSV_COLUMNS, rows)
+        print(f"Cross-theme ideas written to: {cross_theme_out}")
+    else:
+        print("No cross-theme ideas were generated.")
+
+    return rows
+
+
 def _run_add_simple_summaries(
     scored_in: str,
     scored_with_summary_out: str,
@@ -362,6 +424,38 @@ def _print_scored_ideas(ideas: list[ScoredCompositeIdea]) -> None:
                 print(f"       Notes:  {idea.scoring_notes[:160]}")
 
 
+def _print_cross_theme_results(rows: list[dict], n: int = 5) -> None:
+    if not rows:
+        print("\nNo cross-theme ideas to display.")
+        return
+    show = rows[:n]
+    print(f"\n{'─'*80}")
+    print(f"CROSS-THEME IDEAS  ({len(rows)} generated, top {len(show)} shown)")
+    print(f"{'─'*80}")
+    print(f"\n{'#':<3} {'TOTAL':>6} {'COMP':>6} {'FUT':>4} {'EXC':>4}  TITLE")
+    print("─" * 80)
+    for i, row in enumerate(show, 1):
+        tp = row.get("total_priority_score", "")
+        cs = row.get("composite_score", "")
+        fi = row.get("future_importance", "")
+        pe = row.get("personal_excitement", "")
+        title = row.get("title", "")[:55]
+        print(f"{i:<3} {str(tp):>6} {str(cs):>6} {str(fi):>4} {str(pe):>4}  {title}")
+    print()
+    for i, row in enumerate(show, 1):
+        themes = ""
+        try:
+            themes = " × ".join(json.loads(row.get("themes_involved", "[]")))
+        except Exception:
+            pass
+        summary = row.get("simple_summary", "")[:120]
+        print(f"#{i} {row.get('title', '')}")
+        if themes:
+            print(f"   Themes: {themes}")
+        print(f"   {summary}")
+        print()
+
+
 def _print_simple_summaries(rows: list[dict], n: int = 5) -> None:
     if not rows:
         print("\nNo rows to display.")
@@ -388,6 +482,13 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     args = parse_args()
+
+    # Standalone: cross-theme composites
+    if args.cross_theme_composites:
+        client = _openai_client()
+        rows = _run_cross_theme_composites(args.cross_theme_out, client)
+        _print_cross_theme_results(rows)
+        return
 
     # Standalone path — no paper loading needed
     if args.add_simple_summaries:

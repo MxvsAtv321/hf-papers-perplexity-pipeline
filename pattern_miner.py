@@ -24,6 +24,10 @@ scored_ideas_to_rows(ideas)                  -> list[dict]   # for CSV writing
 build_simple_summary_prompt(row)             -> list[dict]   # messages
 parse_simple_summary_response(raw)           -> str | None
 add_simple_summaries_to_composites(in, out, llm_fn) -> list[dict]
+
+build_cross_theme_prompt(name, candidates, themes) -> list[dict]  # messages
+parse_cross_theme_response(raw, valid_ids)   -> dict | None
+generate_cross_theme_composites(papers, themes, llm_fn, max_ideas) -> list[dict]
 """
 
 from __future__ import annotations
@@ -186,6 +190,48 @@ THEME_SEEDS: dict[str, list[str]] = {
         "adaptive autonomy", "conversational", "human-in-the-loop",
     ],
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-theme target intersections (ordered: highest-priority first)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Each entry: (intersection_name, [theme_name, ...])
+# The LLM is asked to propose ONE idea per intersection using papers from ≥2 themes.
+CROSS_THEME_INTERSECTIONS: list[tuple[str, list[str]]] = [
+    (
+        "World Models × Web Agents × Safety",
+        ["World Models & Simulation", "Web & Computer-Use Agents", "AI Safety & Red-Teaming"],
+    ),
+    (
+        "Robotics × Synthetic Data × Reward Modeling",
+        ["Robotics & Embodied AI", "Synthetic Data & Data Engines", "Reward Modeling & RL"],
+    ),
+    (
+        "On-Device × Digital Humans × Multimodal",
+        ["On-Device & Edge AI", "Digital Humans & Avatars", "Multimodal Models"],
+    ),
+    (
+        "World Models × Code Agents × Evaluation",
+        ["World Models & Simulation", "Code & Software Engineering Agents", "Evaluation & Benchmarking"],
+    ),
+    (
+        "Agent Infrastructure × Causal Reasoning",
+        ["Agent Infrastructure & Orchestration", "Causal & Reasoning AI"],
+    ),
+    (
+        "Robotics × 3D Reconstruction × Embodied AI",
+        ["Robotics & Embodied AI", "3D Reconstruction & Spatial AI"],
+    ),
+    (
+        "Inference Efficiency × On-Device × Agents",
+        ["Inference & Training Efficiency", "On-Device & Edge AI", "Agent Infrastructure & Orchestration"],
+    ),
+    (
+        "Safety × Evaluation × Agent Infrastructure",
+        ["AI Safety & Red-Teaming", "Evaluation & Benchmarking", "Agent Infrastructure & Orchestration"],
+    ),
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1238,3 +1284,442 @@ def add_simple_summaries_to_composites(
     write_csv(output_csv, out_columns, enriched)
     LOGGER.info("Wrote %s enriched rows to %s", len(enriched), output_csv)
     return enriched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-theme composite generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+CROSS_THEME_CSV_COLUMNS = [
+    "id",
+    "theme_name",           # always "CROSS-THEME"
+    "themes_involved",      # JSON list of actual theme names used
+    "paper_ids",
+    "title",
+    "core_capability",
+    "added_value",
+    "target_user",
+    "problem_statement",
+    "wedge_description",
+    "risks",
+    "wedge_clarity",
+    "technical_moat",
+    "market_pull",
+    "founder_fit",
+    "composite_synergy",
+    "composite_score",
+    "simple_summary",
+    "future_importance",
+    "personal_excitement",
+    "total_priority_score",
+    "scoring_notes",
+]
+
+
+def _select_cross_theme_candidates(
+    theme: Theme,
+    papers_by_id: dict[str, AnalyzedPaper],
+    max_per_theme: int = 3,
+) -> list[AnalyzedPaper]:
+    """Select the best papers from a theme for cross-theme combination.
+
+    Priority order: claude_final_label=='keep' > overall_score>=4 & startup_potential>=4.
+    Within each tier, sorted by overall_score desc then startup_potential desc.
+    """
+    members = [papers_by_id[pid] for pid in theme.paper_ids if pid in papers_by_id]
+    keeps = sorted(
+        [p for p in members if p.claude_final_label == "keep"],
+        key=lambda p: (p.overall_score or 0, p.startup_potential or 0),
+        reverse=True,
+    )
+    high_score = sorted(
+        [
+            p for p in members
+            if p.claude_final_label != "keep"
+            and (p.overall_score or 0) >= 4
+            and (p.startup_potential or 0) >= 4
+        ],
+        key=lambda p: (p.overall_score or 0, p.startup_potential or 0),
+        reverse=True,
+    )
+    return (keeps + high_score)[:max_per_theme]
+
+
+_CROSS_THEME_SYSTEM = """\
+You are a deep-tech startup strategist focused on what will matter most in the next
+5–10 years of AI, agents, and robotics. You help founders find products at the
+intersection of multiple AI research fronts.
+
+FOUNDER PREFERENCES (use these when assigning future_importance and personal_excitement)
+- Useful TODAY: clear buyer, concrete wedge, measurable ROI.
+- More important TOMORROW: positioned at long-run AI shifts (world models, autonomous
+  agents, embodied AI, AI safety infrastructure, long-context reasoning).
+- Most exciting personally: world models, robotics, autonomy, new interaction patterns,
+  agent safety. Less exciting: pure devtools, fine-tuning infra, dataset curation alone.
+
+EXTRA SCORES — assign both yourself (integer 1–5):
+
+future_importance (1–5):
+  1 = Likely eaten by platform features or commoditized within 1–2 years.
+  3 = Still relevant in 3–5 years, but possibly niche or partially commoditized.
+  5 = Squarely on the path of major AI shifts; becomes strictly MORE valuable as
+      agent/model capabilities grow.
+
+personal_excitement (1–5):
+  1 = Pure enterprise plumbing; no autonomy, world-model, or agent angle.
+  3 = Moderately interesting technically, but doesn't open new worlds or interaction modes.
+  5 = Very exciting for a founder who likes world models, robotics, agents, new interfaces,
+      while still anchored in a real wedge.
+
+OUTPUT — respond ONLY with valid JSON matching this schema exactly:
+{
+  "title": "<concept name, ≤10 words>",
+  "core_capability": "<what the combined system can do that no single paper achieves>",
+  "added_value": "<concrete advantage of combining vs. each theme alone>",
+  "target_user": "<specific persona in workflow language>",
+  "problem_statement": "<the concrete workflow problem this solves>",
+  "wedge_description": "<narrow entry point — name first customer type and immediate ROI>",
+  "risks": "<copy risk, technical unknowns, adoption challenges — 1–2 sentences>",
+  "paper_ids": ["<id1>", "<id2>"],
+  "themes_involved": ["<theme1>", "<theme2>"],
+  "future_importance": <int 1-5>,
+  "personal_excitement": <int 1-5>
+}
+
+RULES
+- Choose 2–3 papers total from DIFFERENT themes listed below.
+- The idea must create more value than either theme alone — not just concatenation.
+- Be concrete about the wedge: name the first customer type and their immediate ROI.
+- If no compelling combination exists, return: {"skip": true, "reason": "<brief>"}
+- Do NOT invent paper IDs; only use IDs from the candidates listed in the user message."""
+
+
+def build_cross_theme_prompt(
+    intersection_name: str,
+    candidates_by_theme: dict[str, list[AnalyzedPaper]],
+    themes_by_name: dict[str, Theme],
+) -> list[dict]:
+    """Build a messages list to generate one cross-theme composite startup idea.
+
+    Args:
+        intersection_name: Human-readable label for this intersection.
+        candidates_by_theme: Best papers from each relevant theme.
+        themes_by_name: Full theme objects (used for summaries).
+
+    Returns:
+        messages list suitable for passing to an OpenAI chat call.
+    """
+    lines = [
+        f"INTERSECTION: {intersection_name}",
+        "",
+        "CANDIDATE PAPERS BY THEME",
+        "(Only use paper_ids listed here. Pick 2–3 across at least 2 themes.)",
+        "",
+    ]
+
+    for theme_name, papers in candidates_by_theme.items():
+        theme = themes_by_name.get(theme_name)
+        theme_ctx = (theme.summary or "")[:220] if theme else ""
+
+        lines.append(f"── {theme_name} ──")
+        if theme_ctx:
+            lines.append(f"Theme context: {theme_ctx}")
+        lines.append("")
+
+        for p in papers:
+            keep_flag = " [KEEP ★]" if p.claude_final_label == "keep" else ""
+            scores = (
+                f"overall={p.overall_score} startup={p.startup_potential} "
+                f"market={p.market_pull} moat={p.technical_moat}"
+            )
+            lines.append(f"  paper_id: {p.paper_id}{keep_flag}")
+            lines.append(f"  title: {p.title}")
+            if p.abstract:
+                lines.append(f"  abstract: {p.abstract[:220]}")
+            if p.capability:
+                lines.append(f"  capability: {p.capability[:180]}")
+            lines.append(f"  scores: {scores}")
+            if p.claude_final_score is not None:
+                lines.append(
+                    f"  claude: {p.claude_final_score}/5 ({p.claude_final_label})"
+                )
+            lines.append("")
+
+    lines.append(
+        "Propose ONE focused cross-theme startup concept using 2–3 of these papers "
+        "from different themes. Return the JSON schema from your system prompt."
+    )
+
+    return [
+        {"role": "system", "content": _CROSS_THEME_SYSTEM},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+def parse_cross_theme_response(
+    raw: str,
+    valid_paper_ids: set[str],
+) -> dict[str, Any] | None:
+    """Parse an LLM cross-theme idea response.
+
+    Returns None when the model skipped, required fields are missing, or fewer
+    than 2 valid paper_ids are present.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            LOGGER.warning("cross-theme: could not parse JSON")
+            return None
+        try:
+            data = json.loads(match.group())
+        except json.JSONDecodeError:
+            LOGGER.warning("cross-theme: could not parse extracted JSON")
+            return None
+
+    if data.get("skip"):
+        LOGGER.info("LLM skipped cross-theme intersection: %s", data.get("reason", ""))
+        return None
+
+    required = [
+        "title", "core_capability", "added_value", "target_user",
+        "problem_statement", "wedge_description", "risks", "paper_ids",
+    ]
+    missing = [k for k in required if not data.get(k)]
+    if missing:
+        LOGGER.warning("cross-theme response missing fields: %s", missing)
+        return None
+
+    # Filter paper_ids to only those we actually offered
+    raw_ids = data.get("paper_ids", [])
+    valid = [pid for pid in raw_ids if pid in valid_paper_ids]
+    if len(valid) < 2:
+        LOGGER.warning(
+            "cross-theme idea has only %s valid paper_ids (need ≥2), offered=%s, got=%s",
+            len(valid), valid_paper_ids, raw_ids,
+        )
+        return None
+
+    data["paper_ids"] = valid
+    return data
+
+
+def generate_cross_theme_composites(
+    papers_by_id: dict[str, AnalyzedPaper],
+    themes: list[Theme],
+    llm_fn: Callable[[list[dict]], str],
+    max_ideas: int = 8,
+) -> list[dict]:
+    """Generate, score, and summarize cross-theme composite startup ideas.
+
+    Iterates over CROSS_THEME_INTERSECTIONS in order, proposes one idea per
+    intersection via the LLM, then scores it on 5 axes, adds a simple_summary,
+    and computes total_priority_score.
+
+    Args:
+        papers_by_id: Full paper lookup dict.
+        themes: List of Theme objects (with summaries preferred).
+        llm_fn: Callable that takes a messages list and returns raw JSON string.
+        max_ideas: Stop after producing this many ideas (default 8).
+
+    Returns:
+        List of flat row dicts sorted by total_priority_score desc,
+        ready for write_csv(..., CROSS_THEME_CSV_COLUMNS, ...).
+    """
+    themes_by_name = {t.name: t for t in themes}
+    results: list[dict] = []
+
+    for intersection_name, theme_names in CROSS_THEME_INTERSECTIONS:
+        if len(results) >= max_ideas:
+            break
+
+        # Build per-theme candidate lists
+        candidates_by_theme: dict[str, list[AnalyzedPaper]] = {}
+        for theme_name in theme_names:
+            theme = themes_by_name.get(theme_name)
+            if not theme:
+                LOGGER.debug("cross-theme: theme not found: %s", theme_name)
+                continue
+            papers = _select_cross_theme_candidates(theme, papers_by_id)
+            if papers:
+                candidates_by_theme[theme_name] = papers
+
+        if len(candidates_by_theme) < 2:
+            LOGGER.info(
+                "cross-theme: skipping '%s' — only %s theme(s) had candidates",
+                intersection_name, len(candidates_by_theme),
+            )
+            continue
+
+        valid_ids = {
+            p.paper_id
+            for ps in candidates_by_theme.values()
+            for p in ps
+        }
+        messages = build_cross_theme_prompt(intersection_name, candidates_by_theme, themes_by_name)
+
+        # Step 1: Generate the idea
+        idea_dict: dict[str, Any] | None = None
+        for attempt in range(2):
+            try:
+                raw = llm_fn(messages)
+                idea_dict = parse_cross_theme_response(raw, valid_ids)
+                if idea_dict is not None:
+                    break
+            except Exception as exc:
+                LOGGER.warning(
+                    "cross-theme generation attempt %s for '%s': %s",
+                    attempt + 1, intersection_name, exc,
+                )
+
+        if idea_dict is None:
+            LOGGER.info("cross-theme: no idea produced for '%s'", intersection_name)
+            continue
+
+        idea_id = str(uuid.uuid4())[:8]
+        idea = CompositeIdea(
+            id=idea_id,
+            title=str(idea_dict.get("title", "")),
+            theme_name="CROSS-THEME",
+            paper_ids=idea_dict.get("paper_ids", []),
+            core_capability=str(idea_dict.get("core_capability", "")),
+            added_value=str(idea_dict.get("added_value", "")),
+            target_user=str(idea_dict.get("target_user", "")),
+            problem_statement=str(idea_dict.get("problem_statement", "")),
+            wedge_description=str(idea_dict.get("wedge_description", "")),
+            risks=str(idea_dict.get("risks", "")),
+        )
+
+        # Step 2: Score on 5 axes (reuse existing pipeline)
+        signals = aggregate_paper_signals(idea.paper_ids, papers_by_id)
+        score_result: dict[str, Any] | None = None
+        for attempt in range(2):
+            try:
+                score_raw = llm_fn(build_scoring_prompt(idea, signals))
+                score_result = parse_score_response(score_raw)
+                if score_result is not None:
+                    break
+            except Exception as exc:
+                LOGGER.warning(
+                    "cross-theme scoring attempt %s for '%s': %s",
+                    attempt + 1, idea.title, exc,
+                )
+
+        composite_score: float | None = score_result["composite_score"] if score_result else None
+
+        # Step 3: Generate simple_summary (reuse existing helper)
+        row_for_summary: dict[str, Any] = {
+            "title": idea.title,
+            "theme_name": "CROSS-THEME",
+            "core_capability": idea.core_capability,
+            "added_value": idea.added_value,
+            "target_user": idea.target_user,
+            "problem_statement": idea.problem_statement,
+            "wedge_description": idea.wedge_description,
+            "composite_score": composite_score or "",
+        }
+        simple_summary = "[summary unavailable]"
+        for attempt in range(2):
+            try:
+                sum_raw = llm_fn(build_simple_summary_prompt(row_for_summary))
+                parsed_sum = parse_simple_summary_response(sum_raw)
+                if parsed_sum:
+                    simple_summary = parsed_sum
+                    break
+            except Exception as exc:
+                LOGGER.warning(
+                    "cross-theme summary attempt %s for '%s': %s",
+                    attempt + 1, idea.title, exc,
+                )
+
+        # Step 4: Extract extra scores and compute total_priority_score
+        future_importance: int | None = _int(idea_dict.get("future_importance"))
+        personal_excitement: int | None = _int(idea_dict.get("personal_excitement"))
+
+        total_priority_score: float | None = None
+        if (
+            composite_score is not None
+            and future_importance is not None
+            and personal_excitement is not None
+        ):
+            total_priority_score = round(
+                0.5 * composite_score + 0.3 * future_importance + 0.2 * personal_excitement,
+                2,
+            )
+
+        themes_involved = idea_dict.get(
+            "themes_involved",
+            list(candidates_by_theme.keys()),
+        )
+
+        result_row: dict[str, Any] = {
+            "id": idea_id,
+            "theme_name": "CROSS-THEME",
+            "themes_involved": json.dumps(themes_involved),
+            "paper_ids": json.dumps(idea.paper_ids),
+            "title": idea.title,
+            "core_capability": idea.core_capability,
+            "added_value": idea.added_value,
+            "target_user": idea.target_user,
+            "problem_statement": idea.problem_statement,
+            "wedge_description": idea.wedge_description,
+            "risks": idea.risks,
+            "wedge_clarity": score_result["wedge_clarity"] if score_result else "",
+            "technical_moat": score_result["technical_moat"] if score_result else "",
+            "market_pull": score_result["market_pull"] if score_result else "",
+            "founder_fit": score_result["founder_fit"] if score_result else "",
+            "composite_synergy": score_result["composite_synergy"] if score_result else "",
+            "composite_score": composite_score if composite_score is not None else "",
+            "simple_summary": simple_summary,
+            "future_importance": future_importance if future_importance is not None else "",
+            "personal_excitement": personal_excitement if personal_excitement is not None else "",
+            "total_priority_score": total_priority_score if total_priority_score is not None else "",
+            "scoring_notes": score_result.get("scoring_notes", "") if score_result else "",
+        }
+        results.append(result_row)
+        LOGGER.info(
+            "cross-theme idea: '%s'  total_priority=%.2f",
+            idea.title, total_priority_score or 0.0,
+        )
+
+    # Sort by total_priority_score desc (ideas with a score come before failures)
+    results.sort(
+        key=lambda r: (r["total_priority_score"] != "", float(r["total_priority_score"] or 0)),
+        reverse=True,
+    )
+    return results
+
+
+def load_themes_from_csv(csv_path: str) -> list[Theme]:
+    """Load themes from a previously written papers_themes.csv.
+
+    Args:
+        csv_path: Path to the themes CSV.
+
+    Returns:
+        List of Theme objects, or [] if the file doesn't exist.
+    """
+    if not os.path.exists(csv_path):
+        LOGGER.warning("Themes file not found: %s", csv_path)
+        return []
+    themes: list[Theme] = []
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            try:
+                paper_ids = json.loads(row.get("paper_ids", "[]"))
+            except json.JSONDecodeError:
+                paper_ids = []
+            try:
+                keywords = [k.strip() for k in row.get("keywords", "").split(",") if k.strip()]
+            except Exception:
+                keywords = []
+            themes.append(Theme(
+                name=row.get("theme_name", ""),
+                keywords=keywords,
+                paper_ids=paper_ids,
+                summary=row.get("summary") or None,
+            ))
+    LOGGER.info("Loaded %s themes from %s", len(themes), csv_path)
+    return themes

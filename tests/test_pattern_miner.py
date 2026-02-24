@@ -15,24 +15,31 @@ from pattern_miner import (
     ScoredCompositeIdea,
     Theme,
     COMPOSITES_CSV_COLUMNS,
+    CROSS_THEME_CSV_COLUMNS,
+    CROSS_THEME_INTERSECTIONS,
     SCORED_COMPOSITES_CSV_COLUMNS,
     SCORED_WITH_SUMMARY_CSV_COLUMNS,
     THEMES_CSV_COLUMNS,
     _are_complementary,
     _collapse_product_angles,
     _row_to_paper,
+    _select_cross_theme_candidates,
     add_simple_summaries_to_composites,
     aggregate_paper_signals,
     build_composite_prompt,
+    build_cross_theme_prompt,
     build_scoring_prompt,
     build_simple_summary_prompt,
     build_theme_summary_prompt,
     composite_ideas_to_rows,
     extract_themes,
     find_composite_candidates,
+    generate_cross_theme_composites,
     load_composite_ideas,
     load_papers,
+    load_themes_from_csv,
     parse_composite_response,
+    parse_cross_theme_response,
     parse_score_response,
     parse_simple_summary_response,
     score_composite_ideas,
@@ -981,3 +988,242 @@ def test_scored_with_summary_csv_columns_includes_simple_summary() -> None:
     # All scored columns also present
     for col in SCORED_COMPOSITES_CSV_COLUMNS:
         assert col in SCORED_WITH_SUMMARY_CSV_COLUMNS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cross-theme composite generation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _theme(name: str, paper_ids: list[str], summary: str = "") -> Theme:
+    return Theme(name=name, keywords=[], paper_ids=paper_ids, summary=summary or None)
+
+
+def test_select_cross_theme_candidates_prefers_keeps() -> None:
+    keep = _paper("0001", overall_score=4, startup_potential=4, claude_final_label="keep")
+    high = _paper("0002", overall_score=4, startup_potential=4, claude_final_label=None)
+    low  = _paper("0003", overall_score=2, startup_potential=2, claude_final_label=None)
+    theme = _theme("T", ["0001", "0002", "0003"])
+    papers_by_id = {"0001": keep, "0002": high, "0003": low}
+
+    result = _select_cross_theme_candidates(theme, papers_by_id, max_per_theme=3)
+    assert result[0].paper_id == "0001"   # keep first
+    assert result[1].paper_id == "0002"   # high-score second
+    assert all(p.paper_id != "0003" for p in result)  # low excluded
+
+
+def test_select_cross_theme_candidates_respects_max() -> None:
+    papers = {str(i): _paper(str(i), overall_score=4, startup_potential=4) for i in range(10)}
+    theme = _theme("T", list(papers.keys()))
+    result = _select_cross_theme_candidates(theme, papers, max_per_theme=2)
+    assert len(result) <= 2
+
+
+def test_select_cross_theme_candidates_empty_when_all_low_score() -> None:
+    p = _paper("0001", overall_score=2, startup_potential=2)
+    theme = _theme("T", ["0001"])
+    result = _select_cross_theme_candidates(theme, {"0001": p})
+    assert result == []
+
+
+def test_cross_theme_csv_columns_has_required_fields() -> None:
+    required = [
+        "id", "theme_name", "themes_involved", "paper_ids", "title",
+        "composite_score", "simple_summary", "future_importance",
+        "personal_excitement", "total_priority_score",
+    ]
+    for col in required:
+        assert col in CROSS_THEME_CSV_COLUMNS
+
+
+def test_cross_theme_intersections_nonempty() -> None:
+    assert len(CROSS_THEME_INTERSECTIONS) >= 4
+    for name, themes in CROSS_THEME_INTERSECTIONS:
+        assert isinstance(name, str) and name
+        assert len(themes) >= 2
+
+
+def test_build_cross_theme_prompt_structure() -> None:
+    p1 = _paper("0001", title="World Model Paper")
+    p2 = _paper("0002", title="Web Agent Paper")
+    candidates = {
+        "World Models & Simulation": [p1],
+        "Web & Computer-Use Agents": [p2],
+    }
+    themes_by_name = {
+        "World Models & Simulation": _theme("World Models & Simulation", ["0001"], "World models summary."),
+        "Web & Computer-Use Agents": _theme("Web & Computer-Use Agents", ["0002"], "Web agents summary."),
+    }
+    messages = build_cross_theme_prompt("World Models × Web Agents", candidates, themes_by_name)
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    content = messages[1]["content"]
+    assert "World Model Paper" in content
+    assert "Web Agent Paper" in content
+    assert "0001" in content
+    assert "0002" in content
+
+
+def test_build_cross_theme_prompt_marks_keeps() -> None:
+    p = _paper("0001", claude_final_label="keep")
+    candidates = {"Robotics & Embodied AI": [p]}
+    themes_by_name = {"Robotics & Embodied AI": _theme("Robotics & Embodied AI", ["0001"])}
+    messages = build_cross_theme_prompt("Test", candidates, themes_by_name)
+    assert "KEEP" in messages[1]["content"]
+
+
+def _valid_cross_theme_response(paper_ids: list[str] | None = None) -> str:
+    return json.dumps({
+        "title": "Cross-Theme Startup",
+        "core_capability": "Does something novel across themes.",
+        "added_value": "Better together.",
+        "target_user": "ML engineer at mid-size company.",
+        "problem_statement": "Current tools don't cross themes well.",
+        "wedge_description": "Start with one vertical.",
+        "risks": "Hard to copy but technically risky.",
+        "paper_ids": paper_ids or ["0001", "0002"],
+        "themes_involved": ["Theme A", "Theme B"],
+        "future_importance": 5,
+        "personal_excitement": 4,
+    })
+
+
+def test_parse_cross_theme_response_valid() -> None:
+    raw = _valid_cross_theme_response(["0001", "0002"])
+    result = parse_cross_theme_response(raw, {"0001", "0002", "0003"})
+    assert result is not None
+    assert result["title"] == "Cross-Theme Startup"
+    assert result["paper_ids"] == ["0001", "0002"]
+
+
+def test_parse_cross_theme_response_filters_invalid_ids() -> None:
+    raw = _valid_cross_theme_response(["0001", "9999"])  # 9999 not in valid set
+    result = parse_cross_theme_response(raw, {"0001", "0002"})
+    # Only "0001" is valid — fewer than 2 → None
+    assert result is None
+
+
+def test_parse_cross_theme_response_skip() -> None:
+    raw = json.dumps({"skip": True, "reason": "No compelling combination."})
+    result = parse_cross_theme_response(raw, {"0001", "0002"})
+    assert result is None
+
+
+def test_parse_cross_theme_response_missing_fields() -> None:
+    raw = json.dumps({"title": "Only a title"})
+    result = parse_cross_theme_response(raw, {"0001", "0002"})
+    assert result is None
+
+
+def test_parse_cross_theme_response_invalid_json() -> None:
+    result = parse_cross_theme_response("not json at all", {"0001"})
+    assert result is None
+
+
+# ── generate_cross_theme_composites (integration with mocked LLM) ──────────
+
+def _make_cross_theme_llm_fn(paper_ids: list[str]) -> Callable[[list[dict]], str]:
+    """Returns a mock LLM fn that gives a valid cross-theme idea, then scores, then summary."""
+    from collections import deque
+
+    # Response queue: cross-theme idea → scoring → simple summary
+    responses: deque = deque([
+        _valid_cross_theme_response(paper_ids),
+        json.dumps({
+            "wedge_clarity": 4, "technical_moat": 4, "market_pull": 4,
+            "founder_fit": 4, "composite_synergy": 4, "scoring_notes": "Good.",
+        }),
+        json.dumps({"simple_summary": "This is for engineers. It does great things. Very exciting."}),
+    ])
+
+    def fn(messages: list[dict]) -> str:
+        if responses:
+            return responses.popleft()
+        return json.dumps({"simple_summary": "Fallback summary."})
+
+    return fn
+
+
+def test_generate_cross_theme_composites_produces_idea() -> None:
+    p1 = _paper("0001", overall_score=4, startup_potential=4, claude_final_label="keep")
+    p2 = _paper("0002", overall_score=4, startup_potential=4)
+    papers_by_id = {"0001": p1, "0002": p2}
+
+    themes = [
+        _theme("World Models & Simulation", ["0001"]),
+        _theme("Web & Computer-Use Agents", ["0002"]),
+    ]
+    # Only first intersection matches; limit to 1
+    llm_fn = _make_cross_theme_llm_fn(["0001", "0002"])
+    results = generate_cross_theme_composites(papers_by_id, themes, llm_fn, max_ideas=1)
+
+    assert len(results) == 1
+    row = results[0]
+    assert row["theme_name"] == "CROSS-THEME"
+    assert row["title"] == "Cross-Theme Startup"
+    assert row["future_importance"] == 5
+    assert row["personal_excitement"] == 4
+    assert isinstance(row["total_priority_score"], float)
+    assert row["simple_summary"] != "[summary unavailable]"
+
+
+def test_generate_cross_theme_composites_total_priority_formula() -> None:
+    """total = 0.5*composite + 0.3*future + 0.2*excitement."""
+    p1 = _paper("0001", overall_score=4, startup_potential=4, claude_final_label="keep")
+    p2 = _paper("0002", overall_score=4, startup_potential=4)
+    papers_by_id = {"0001": p1, "0002": p2}
+    themes = [
+        _theme("World Models & Simulation", ["0001"]),
+        _theme("Web & Computer-Use Agents", ["0002"]),
+    ]
+    llm_fn = _make_cross_theme_llm_fn(["0001", "0002"])
+    results = generate_cross_theme_composites(papers_by_id, themes, llm_fn, max_ideas=1)
+
+    row = results[0]
+    cs = float(row["composite_score"])
+    fi = float(row["future_importance"])
+    pe = float(row["personal_excitement"])
+    expected = round(0.5 * cs + 0.3 * fi + 0.2 * pe, 2)
+    assert abs(float(row["total_priority_score"]) - expected) < 0.01
+
+
+def test_generate_cross_theme_composites_skips_when_too_few_themes() -> None:
+    # Only one theme available — no cross-theme idea possible
+    p1 = _paper("0001", overall_score=4, startup_potential=4)
+    papers_by_id = {"0001": p1}
+    themes = [_theme("World Models & Simulation", ["0001"])]
+
+    called = []
+    def llm_fn(messages: list[dict]) -> str:
+        called.append(1)
+        return _valid_cross_theme_response(["0001", "0002"])
+
+    results = generate_cross_theme_composites(papers_by_id, themes, llm_fn, max_ideas=8)
+    # No calls should be made since no intersection has 2+ themes with candidates
+    assert len(results) == 0
+
+
+def test_load_themes_from_csv_basic(tmp_path: Path) -> None:
+    themes_path = tmp_path / "themes.csv"
+    rows = [
+        {"theme_name": "Robotics", "keywords": "robot, manipulation",
+         "paper_ids": '["0001","0002"]', "summary": "Robots doing things.", "num_papers": "2"},
+    ]
+    with themes_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    loaded = load_themes_from_csv(str(themes_path))
+    assert len(loaded) == 1
+    assert loaded[0].name == "Robotics"
+    assert loaded[0].paper_ids == ["0001", "0002"]
+    assert loaded[0].summary == "Robots doing things."
+
+
+def test_load_themes_from_csv_missing_file(tmp_path: Path) -> None:
+    result = load_themes_from_csv(str(tmp_path / "nonexistent.csv"))
+    assert result == []
+
+
+# Need Callable for the test helper
+from typing import Callable
