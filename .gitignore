@@ -2,3 +2,13 @@
 __pycache__/
 .pytest_cache/
 .env
+.DS_Store
+
+# Generated CSV outputs (data artifacts — regenerate with pipeline/mine_patterns.py)
+papers_pipeline.csv
+papers_pipeline_old_schema.csv
+papers_wide_scout.csv
+papers_debated.csv
+papers_top_picks.csv
+papers_themes.csv
+papers_composite_ideas.csv
