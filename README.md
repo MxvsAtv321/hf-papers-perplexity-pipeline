@@ -46,8 +46,12 @@ Idempotency is enforced by checking `paper_id` in the CSV before any API work.
    - Optional: `CLAUDE_MODEL` (default `claude-opus-4-6`)
    - Optional: `CSV_OUTPUT_PATH` (default `papers_pipeline.csv`)
    - Optional: `HF_MAX_AGE_DAYS` (default `180`) — how far back to fetch HF papers
-   - Optional: `HF_FETCH_DAYS` (default `7`) — how many past days to fetch (~50 papers/day, deduplicated)
+   - Optional: `HF_FETCH_DAYS` (default `7`) — how many past days to fetch (~50 papers/day, deduplicated); set to `90` for ~3 months of coverage
    - Optional: `AGENTIC_MIN_OVERALL_SCORE` (default `4`) — minimum overall score to trigger debate (also requires startup_potential >= 4 OR market_pull >= 4)
+   - Optional: `MAX_FETCH_DAYS_WIDE` (default `180`) — days window used in `--mode wide_scout`
+   - Optional: `MAX_LLM_PAPERS_WIDE` (default `500`) — Stage 2 cap in `--mode wide_scout`
+   - Optional: `MAX_DEEP_PAPERS_WIDE` (default `0`) — Stage 3-4 cap in `--mode wide_scout` (0 = skip)
+   - Optional: `WIDE_SCOUT_CSV_PATH` (default `papers_wide_scout.csv`) — output file for `--mode wide_scout`
 
 ### Getting API keys
 
@@ -176,13 +180,42 @@ To open in Excel or Google Sheets, just open the CSV file directly — both apps
 
 ## Run
 
+### Full mode (default)
+
+Fetches the past `HF_FETCH_DAYS` days of HF papers, runs all four pipeline stages, and writes results to `papers_pipeline.csv`.
+
 ```bash
-python main.py --limit 10
+python main.py --limit 10          # process up to 10 papers
+python main.py --limit 5 --dry-run # preview without API calls or CSV writes
+```
+
+### Wide scout mode
+
+Broad-coverage sweep that trades depth for breadth. Useful for discovering papers across months of history without spending on Stage 3-4 for every paper.
+
+```bash
+python main.py --mode wide_scout
+python main.py --mode wide_scout --dry-run   # preview: shows how many papers would be scored
+```
+
+Behavior:
+- Fetches `MAX_FETCH_DAYS_WIDE` (default 180) days of HF papers — up to ~9,000 papers.
+- Applies the heuristic filter and deduplicates against `papers_wide_scout.csv`.
+- Runs Stage 2 (OpenAI startup scoring) on up to `MAX_LLM_PAPERS_WIDE` (default 500) papers.
+- If `MAX_DEEP_PAPERS_WIDE > 0`, the top-N papers by `overall_score` also get Stage 3 (Claude debate) and Stage 4 (deep analysis).
+- Results are written to `papers_wide_scout.csv` — completely separate from `papers_pipeline.csv`.
+- Idempotent: re-running skips papers already in `papers_wide_scout.csv`.
+
+Example — score 500 papers, deep-dive top 20:
+
+```bash
+MAX_DEEP_PAPERS_WIDE=20 python main.py --mode wide_scout
 ```
 
 CLI options:
 
-- `--limit N`: max number of recent papers to process.
+- `--limit N`: max number of recent papers to process (**full mode only**).
+- `--mode {full,wide_scout}`: pipeline mode (default: `full`).
 - `--dry-run`: prints what would be processed, skips all API calls and CSV writes.
 
 ## Scheduling
