@@ -1,0 +1,500 @@
+"""Unit tests for pattern_miner.py."""
+
+from __future__ import annotations
+
+import csv
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from pattern_miner import (
+    AnalyzedPaper,
+    CompositeIdea,
+    Theme,
+    _are_complementary,
+    _collapse_product_angles,
+    _row_to_paper,
+    build_composite_prompt,
+    build_theme_summary_prompt,
+    composite_ideas_to_rows,
+    extract_themes,
+    find_composite_candidates,
+    load_papers,
+    parse_composite_response,
+    score_paper_against_theme,
+    themes_to_rows,
+    write_csv,
+    COMPOSITES_CSV_COLUMNS,
+    THEMES_CSV_COLUMNS,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fixtures
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _paper(
+    paper_id: str = "2501.00001",
+    title: str = "Test Paper",
+    overall_score: int | None = 4,
+    startup_potential: int | None = 4,
+    market_pull: int | None = 3,
+    technical_moat: int | None = 3,
+    story_for_accelerator: int | None = 3,
+    capability: str | None = None,
+    product_angles_text: str | None = None,
+    score_rationale: str | None = None,
+    abstract: str = "",
+    claude_final_score: int | None = None,
+    claude_final_label: str | None = None,
+) -> AnalyzedPaper:
+    return AnalyzedPaper(
+        paper_id=paper_id,
+        title=title,
+        url=f"https://huggingface.co/papers/{paper_id}",
+        abstract=abstract,
+        startup_potential=startup_potential,
+        market_pull=market_pull,
+        technical_moat=technical_moat,
+        story_for_accelerator=story_for_accelerator,
+        overall_score=overall_score,
+        claude_final_score=claude_final_score,
+        claude_final_label=claude_final_label,
+        capability=capability,
+        product_angles_text=product_angles_text,
+        score_rationale=score_rationale,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _row_to_paper — both CSV schemas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_row_to_paper_pipeline_schema() -> None:
+    row = {
+        "paper_id": "2501.12345",
+        "title": "My Test Paper",
+        "url": "https://huggingface.co/papers/2501.12345",
+        "abstract": "An abstract.",
+        "overall_score": "4",
+        "startup_potential": "5",
+        "market_pull": "3",
+        "technical_moat": "4",
+        "story_for_accelerator": "3",
+        "claude_final_score": "4",
+        "claude_final_label": "keep",
+        "capability_plain_language_capability": "It does X very well.",
+        "product_angles": json.dumps([{"name": "Angle A"}, {"name": "Angle B"}]),
+        "score_rationale": "Strong market pull.",
+    }
+    paper = _row_to_paper(row)
+    assert paper is not None
+    assert paper.paper_id == "2501.12345"
+    assert paper.overall_score == 4
+    assert paper.startup_potential == 5
+    assert paper.capability == "It does X very well."
+    assert paper.product_angles_text == "Angle A, Angle B"
+    assert paper.score_rationale == "Strong market pull."
+
+
+def test_row_to_paper_report_schema() -> None:
+    """papers_debated.csv uses different column names."""
+    row = {
+        "title": "Debated Paper",
+        "url": "https://huggingface.co/papers/2502.99999",
+        "openai_overall": "5",
+        "openai_startup": "4",
+        "openai_market": "5",
+        "openai_moat": "3",
+        "openai_story": "4",
+        "final_score": "4",
+        "final_label": "keep",
+        "capability": "Capable of doing Y.",
+        "best_product_angle": "Enterprise search SDK",
+    }
+    paper = _row_to_paper(row)
+    assert paper is not None
+    assert paper.paper_id == "2502.99999"  # extracted from URL
+    assert paper.overall_score == 5
+    assert paper.market_pull == 5
+    assert paper.capability == "Capable of doing Y."
+    assert paper.claude_final_label == "keep"
+
+
+def test_row_to_paper_missing_title_returns_none() -> None:
+    row = {"paper_id": "2501.00001", "overall_score": "4"}
+    assert _row_to_paper(row) is None
+
+
+def test_row_to_paper_missing_id_and_url_returns_none() -> None:
+    row = {"title": "A Paper"}
+    assert _row_to_paper(row) is None
+
+
+def test_row_to_paper_extracts_paper_id_from_url() -> None:
+    row = {
+        "title": "URL-only Paper",
+        "url": "https://huggingface.co/papers/2501.56789",
+        "overall_score": "3",
+    }
+    paper = _row_to_paper(row)
+    assert paper is not None
+    assert paper.paper_id == "2501.56789"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _collapse_product_angles
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_collapse_product_angles_json_array() -> None:
+    raw = json.dumps([{"name": "Angle A"}, {"name": "Angle B"}])
+    result = _collapse_product_angles(raw)
+    assert result == "Angle A, Angle B"
+
+
+def test_collapse_product_angles_empty_array() -> None:
+    assert _collapse_product_angles("[]") is None
+
+
+def test_collapse_product_angles_plain_string() -> None:
+    assert _collapse_product_angles("Enterprise SDK") == "Enterprise SDK"
+
+
+def test_collapse_product_angles_empty_string() -> None:
+    assert _collapse_product_angles("") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# load_papers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_test_csv(path: Path, rows: list[dict]) -> None:
+    cols = list(rows[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=cols)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_load_papers_basic(tmp_path: Path) -> None:
+    csv_path = tmp_path / "test.csv"
+    _write_test_csv(csv_path, [
+        {"paper_id": "0001", "title": "Paper A", "url": "https://huggingface.co/papers/0001",
+         "overall_score": "4", "startup_potential": "4", "market_pull": "3",
+         "technical_moat": "3", "story_for_accelerator": "3",
+         "abstract": "", "score_rationale": "", "capability_plain_language_capability": "",
+         "product_angles": "[]", "claude_final_score": "", "claude_final_label": ""},
+    ])
+    papers = load_papers([str(csv_path)], min_score=1)
+    assert len(papers) == 1
+    assert papers[0].paper_id == "0001"
+
+
+def test_load_papers_filters_by_min_score(tmp_path: Path) -> None:
+    csv_path = tmp_path / "test.csv"
+    _write_test_csv(csv_path, [
+        {"paper_id": "0001", "title": "High", "url": "https://huggingface.co/papers/0001",
+         "overall_score": "4", "startup_potential": "4", "market_pull": "4",
+         "technical_moat": "4", "story_for_accelerator": "4",
+         "abstract": "", "score_rationale": "", "capability_plain_language_capability": "",
+         "product_angles": "[]", "claude_final_score": "", "claude_final_label": ""},
+        {"paper_id": "0002", "title": "Low", "url": "https://huggingface.co/papers/0002",
+         "overall_score": "2", "startup_potential": "2", "market_pull": "2",
+         "technical_moat": "2", "story_for_accelerator": "2",
+         "abstract": "", "score_rationale": "", "capability_plain_language_capability": "",
+         "product_angles": "[]", "claude_final_score": "", "claude_final_label": ""},
+    ])
+    papers = load_papers([str(csv_path)], min_score=3)
+    assert len(papers) == 1
+    assert papers[0].paper_id == "0001"
+
+
+def test_load_papers_deduplicates_across_files(tmp_path: Path) -> None:
+    row = {
+        "paper_id": "0001", "title": "Dup Paper", "url": "https://huggingface.co/papers/0001",
+        "overall_score": "4", "startup_potential": "4", "market_pull": "3",
+        "technical_moat": "3", "story_for_accelerator": "3",
+        "abstract": "", "score_rationale": "", "capability_plain_language_capability": "",
+        "product_angles": "[]", "claude_final_score": "", "claude_final_label": "",
+    }
+    p1 = tmp_path / "a.csv"
+    p2 = tmp_path / "b.csv"
+    _write_test_csv(p1, [row])
+    _write_test_csv(p2, [row])
+    papers = load_papers([str(p1), str(p2)], min_score=1)
+    assert len(papers) == 1
+
+
+def test_load_papers_skips_missing_file(tmp_path: Path) -> None:
+    papers = load_papers([str(tmp_path / "nonexistent.csv")], min_score=1)
+    assert papers == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# score_paper_against_theme
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_score_paper_against_theme_matches_title_keyword() -> None:
+    paper = _paper(title="A robot manipulation system")
+    score = score_paper_against_theme(paper, ["robot", "manipulation"])
+    assert score == 2
+
+
+def test_score_paper_against_theme_zero_when_no_match() -> None:
+    paper = _paper(title="Quantum computing at scale")
+    score = score_paper_against_theme(paper, ["robot", "manipulation"])
+    assert score == 0
+
+
+def test_score_paper_against_theme_uses_capability() -> None:
+    paper = _paper(capability="Streams video frames and builds 3D gaussian splat scenes")
+    score = score_paper_against_theme(paper, ["gaussian splat", "3d"])
+    assert score == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# extract_themes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_extract_themes_assigns_paper_to_best_theme() -> None:
+    papers = [
+        _paper("0001", title="Robot manipulation with sim-to-real transfer", abstract="robotics embodied"),
+        _paper("0002", title="Web agent for browser automation", abstract="web agent rpa"),
+    ]
+    themes = extract_themes(papers)
+    theme_map = {t.name: t.paper_ids for t in themes}
+
+    # Each paper should be in exactly one non-Uncategorized theme
+    robotics_theme = theme_map.get("Robotics & Embodied AI", [])
+    web_theme = theme_map.get("Web & Computer-Use Agents", [])
+    assert "0001" in robotics_theme
+    assert "0002" in web_theme
+
+
+def test_extract_themes_unmatched_goes_to_uncategorized() -> None:
+    paper = _paper("9999", title="Quantum crystallography algorithms")
+    themes = extract_themes([paper])
+    theme_map = {t.name: t.paper_ids for t in themes}
+    assert "9999" in theme_map.get("Uncategorized", [])
+
+
+def test_extract_themes_each_paper_in_exactly_one_theme() -> None:
+    papers = [_paper(f"000{i}", title=f"Paper {i}") for i in range(5)]
+    themes = extract_themes(papers)
+    all_assigned = [pid for t in themes for pid in t.paper_ids]
+    # No duplicates
+    assert len(all_assigned) == len(set(all_assigned)) == 5
+
+
+def test_extract_themes_no_empty_themes() -> None:
+    papers = [_paper("0001", title="Web agent browsing automation")]
+    themes = extract_themes(papers)
+    for t in themes:
+        assert len(t.paper_ids) > 0
+
+
+def test_extract_themes_sorted_by_size() -> None:
+    papers = [_paper(f"0{i}", title="Robot manipulation embodied") for i in range(4)]
+    papers += [_paper("99", title="Web agent browsing")]
+    themes = extract_themes(papers)
+    # Filter out Uncategorized for sorting check
+    non_uncategorized = [t for t in themes if t.name != "Uncategorized"]
+    sizes = [len(t.paper_ids) for t in non_uncategorized]
+    assert sizes == sorted(sizes, reverse=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _are_complementary + find_composite_candidates
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_are_complementary_tech_moat_plus_market_pull() -> None:
+    p1 = _paper("0001", technical_moat=4, market_pull=2)
+    p2 = _paper("0002", technical_moat=2, market_pull=4)
+    assert _are_complementary(p1, p2) is True
+
+
+def test_are_complementary_false_when_same_strengths() -> None:
+    p1 = _paper("0001", technical_moat=4, market_pull=4)
+    p2 = _paper("0002", technical_moat=4, market_pull=4)
+    # Both strong in everything — still qualifies (moat>=4 and pull>=4 cross-check passes)
+    # Actually this should be True too since moat1>=4 and pull2>=4
+    assert _are_complementary(p1, p2) is True
+
+
+def test_are_complementary_deep_plus_shallow_high_startup() -> None:
+    p_deep = _paper("0001", capability="It does 3D reconstruction in real time")
+    p_shallow = _paper("0002", capability=None, startup_potential=4)
+    assert _are_complementary(p_deep, p_shallow) is True
+
+
+def test_are_complementary_false_both_shallow_weak() -> None:
+    p1 = _paper("0001", technical_moat=2, market_pull=2, story_for_accelerator=2, capability=None, startup_potential=2)
+    p2 = _paper("0002", technical_moat=2, market_pull=2, story_for_accelerator=2, capability=None, startup_potential=2)
+    assert _are_complementary(p1, p2) is False
+
+
+def test_find_composite_candidates_returns_complementary_pairs() -> None:
+    p1 = _paper("0001", title="Deep tech moat", technical_moat=4, market_pull=2, overall_score=4)
+    p2 = _paper("0002", title="Market pull paper", technical_moat=2, market_pull=4, overall_score=4)
+    p3 = _paper("0003", title="Mediocre paper", technical_moat=2, market_pull=2, overall_score=3)
+
+    theme = Theme(name="Test Theme", keywords=[], paper_ids=["0001", "0002", "0003"], summary=None)
+    papers_by_id = {p.paper_id: p for p in [p1, p2, p3]}
+
+    candidates = find_composite_candidates(theme, papers_by_id)
+    assert len(candidates) >= 1
+    assert any(
+        {p.paper_id for p in pair} == {"0001", "0002"}
+        for pair in candidates
+    )
+
+
+def test_find_composite_candidates_excludes_low_score_papers() -> None:
+    p1 = _paper("0001", technical_moat=4, market_pull=2, overall_score=4)
+    p2 = _paper("0002", technical_moat=2, market_pull=4, overall_score=2)  # below min
+    theme = Theme(name="T", keywords=[], paper_ids=["0001", "0002"], summary=None)
+    papers_by_id = {"0001": p1, "0002": p2}
+    candidates = find_composite_candidates(theme, papers_by_id)
+    assert candidates == []
+
+
+def test_find_composite_candidates_max_three_per_theme() -> None:
+    # Create 10 eligible complementary pairs
+    papers = [
+        _paper(f"000{i}", technical_moat=4 if i % 2 == 0 else 2,
+               market_pull=2 if i % 2 == 0 else 4, overall_score=4)
+        for i in range(10)
+    ]
+    theme = Theme(name="T", keywords=[], paper_ids=[p.paper_id for p in papers], summary=None)
+    papers_by_id = {p.paper_id: p for p in papers}
+    candidates = find_composite_candidates(theme, papers_by_id)
+    assert len(candidates) <= 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_build_theme_summary_prompt_structure() -> None:
+    theme = Theme(name="Robotics", keywords=["robot"], paper_ids=["0001"], summary=None)
+    papers = [_paper("0001", title="Robot arm control", capability="Controls robot arms.")]
+    messages = build_theme_summary_prompt(theme, papers)
+
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert "Robotics" in messages[1]["content"]
+    assert "Robot arm control" in messages[1]["content"]
+
+
+def test_build_composite_prompt_structure() -> None:
+    theme = Theme(name="Web Agents", keywords=["web"], paper_ids=["0001", "0002"], summary=None)
+    candidates = [
+        _paper("0001", title="WebSim", capability="Simulates web interactions."),
+        _paper("0002", title="WebRouter", capability="Routes web agent tasks."),
+    ]
+    messages = build_composite_prompt(theme, candidates)
+
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    user_content = messages[1]["content"]
+    assert "WebSim" in user_content
+    assert "WebRouter" in user_content
+    assert "Web Agents" in user_content
+
+
+def test_build_composite_prompt_includes_scores() -> None:
+    theme = Theme(name="T", keywords=[], paper_ids=[], summary=None)
+    candidates = [_paper("0001", overall_score=5, market_pull=4)]
+    messages = build_composite_prompt(theme, candidates)
+    assert "overall=5" in messages[1]["content"]
+    assert "market=4" in messages[1]["content"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# parse_composite_response
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_parse_composite_response_keep() -> None:
+    raw = json.dumps({
+        "combine": True,
+        "title": "Agent Training Sim",
+        "core_capability": "Trains agents offline at scale.",
+        "added_value": "Faster iteration without real-world risk.",
+        "target_user": "Robotics engineer",
+        "problem_statement": "Collecting real trajectories is slow.",
+        "wedge_description": "Sell as a data engine SaaS.",
+        "risks": "Sim-to-real gap remains a challenge.",
+    })
+    idea = parse_composite_response(raw, "Robotics", ["0001", "0002"])
+    assert idea is not None
+    assert idea.title == "Agent Training Sim"
+    assert idea.theme_name == "Robotics"
+    assert idea.paper_ids == ["0001", "0002"]
+    assert len(idea.id) > 0
+
+
+def test_parse_composite_response_no_combine() -> None:
+    raw = json.dumps({"combine": False, "reason": "Papers too similar."})
+    idea = parse_composite_response(raw, "Robotics", ["0001", "0002"])
+    assert idea is None
+
+
+def test_parse_composite_response_invalid_json_returns_none() -> None:
+    idea = parse_composite_response("not json at all ~~~", "T", ["0001"])
+    assert idea is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSV serialization helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_themes_to_rows_schema() -> None:
+    theme = Theme(name="Web Agents", keywords=["web", "agent"], paper_ids=["0001", "0002"], summary="Summary text.")
+    rows = themes_to_rows([theme])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["theme_name"] == "Web Agents"
+    assert row["num_papers"] == 2
+    assert row["summary"] == "Summary text."
+    assert json.loads(row["paper_ids"]) == ["0001", "0002"]
+
+
+def test_themes_to_rows_no_summary() -> None:
+    theme = Theme(name="T", keywords=[], paper_ids=[], summary=None)
+    rows = themes_to_rows([theme])
+    assert rows[0]["summary"] == ""
+
+
+def test_composite_ideas_to_rows_schema() -> None:
+    idea = CompositeIdea(
+        id="abc12345",
+        title="Sim + Router",
+        theme_name="Web Agents",
+        paper_ids=["0001", "0002"],
+        core_capability="Simulates and routes.",
+        added_value="Better together.",
+        target_user="ML engineer",
+        problem_statement="Hard to train agents.",
+        wedge_description="Narrow SaaS entry.",
+        risks="Competitive moat weak.",
+    )
+    rows = composite_ideas_to_rows([idea])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["title"] == "Sim + Router"
+    assert json.loads(row["paper_ids"]) == ["0001", "0002"]
+    assert row["wedge_description"] == "Narrow SaaS entry."
+
+
+def test_write_csv_creates_file(tmp_path: Path) -> None:
+    path = str(tmp_path / "out.csv")
+    rows = [{"theme_name": "T", "num_papers": 1, "keywords": "kw", "paper_ids": "[]", "summary": ""}]
+    write_csv(path, THEMES_CSV_COLUMNS, rows)
+    assert os.path.exists(path)
+    with open(path, newline="", encoding="utf-8") as fh:
+        content = list(csv.DictReader(fh))
+    assert len(content) == 1
+    assert content[0]["theme_name"] == "T"

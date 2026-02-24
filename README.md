@@ -257,6 +257,86 @@ jobs:
         run: python main.py --limit 20
 ```
 
+## Pattern Mining & Composite Ideas
+
+`mine_patterns.py` is a **meta-layer** that runs on top of existing CSV outputs
+to surface emerging themes and propose composite startup concepts.
+It never re-runs the pipeline — it mines what's already been scored and analyzed.
+
+### What it does
+
+1. **Loads** one or more pipeline CSVs (`papers_wide_scout.csv`, `papers_debated.csv`, etc.)
+   and normalizes them into a common in-memory representation.
+2. **Extracts themes** by scoring each paper against 22 seed-keyword clusters
+   (e.g. *Robotics & Embodied AI*, *Web & Computer-Use Agents*, *Inference & Training Efficiency*).
+   Each paper is assigned to its best-matching theme.
+3. **Generates theme summaries** (optional, requires `OPENAI_API_KEY`) — calls OpenAI once per
+   theme to produce a 2–3 sentence description, 3 startup opportunities, and identified gaps.
+4. **Proposes composite startup ideas** (optional) — finds complementary paper pairs within each
+   theme (strong technical moat + strong market pull, or deep-analysis + high-startup-potential),
+   then asks OpenAI to evaluate whether combining them creates a stronger startup concept.
+
+### Usage
+
+```bash
+# Inspect themes only — no LLM calls, instant:
+python mine_patterns.py
+
+# Generate theme summaries via OpenAI:
+python mine_patterns.py --generate-summaries
+
+# Full run: summaries + composite ideas:
+python mine_patterns.py --generate-summaries --generate-composites
+
+# Only analyse papers labelled 'keep' by Claude:
+python mine_patterns.py --keeps-only --generate-summaries --generate-composites
+
+# Custom inputs and score threshold:
+python mine_patterns.py --input papers_debated.csv --min-score 4
+```
+
+### Output files
+
+#### `papers_themes.csv`
+
+| Column | Description |
+|---|---|
+| `theme_name` | Human-readable theme label |
+| `num_papers` | Number of papers assigned to this theme |
+| `keywords` | Seed keywords that define this theme |
+| `paper_ids` | JSON list of paper IDs in this theme |
+| `summary` | LLM-generated description + opportunities + gaps (empty without `--generate-summaries`) |
+
+#### `papers_composite_ideas.csv`
+
+Each row represents a proposed startup concept that combines 2–3 complementary papers.
+
+| Column | Description |
+|---|---|
+| `id` | Short unique ID for the composite idea |
+| `theme_name` | Theme the idea belongs to |
+| `paper_ids` | JSON list of source paper IDs |
+| `title` | Human-readable concept name (≤10 words) |
+| `core_capability` | What the combined system can do that neither paper alone can |
+| `added_value` | Concrete advantage of combining vs. each paper alone |
+| `target_user` | Specific user persona in workflow language |
+| `problem_statement` | The concrete workflow problem being solved |
+| `wedge_description` | Why this is a good startup wedge — narrow entry, clear ROI |
+| `risks` | Copy risk, technical unknowns, adoption challenges |
+
+### CLI options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--input` | `papers_wide_scout.csv papers_debated.csv` | One or more CSV files to mine |
+| `--min-score` | `3` | Minimum `overall_score` to include a paper |
+| `--keeps-only` | off | Only include papers with `claude_final_label=keep` |
+| `--generate-summaries` | off | Call OpenAI for theme descriptions |
+| `--generate-composites` | off | Call OpenAI to evaluate composite startup ideas |
+| `--themes-out` | `papers_themes.csv` | Output path for themes CSV |
+| `--composites-out` | `papers_composite_ideas.csv` | Output path for composites CSV |
+| `--max-themes` | unlimited | Cap number of themes processed (useful for testing) |
+
 ## Testing
 
 ```bash
