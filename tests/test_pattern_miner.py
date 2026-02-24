@@ -12,22 +12,30 @@ import pytest
 from pattern_miner import (
     AnalyzedPaper,
     CompositeIdea,
+    ScoredCompositeIdea,
     Theme,
+    COMPOSITES_CSV_COLUMNS,
+    SCORED_COMPOSITES_CSV_COLUMNS,
+    THEMES_CSV_COLUMNS,
     _are_complementary,
     _collapse_product_angles,
     _row_to_paper,
+    aggregate_paper_signals,
     build_composite_prompt,
+    build_scoring_prompt,
     build_theme_summary_prompt,
     composite_ideas_to_rows,
     extract_themes,
     find_composite_candidates,
+    load_composite_ideas,
     load_papers,
     parse_composite_response,
+    parse_score_response,
+    score_composite_ideas,
     score_paper_against_theme,
+    scored_ideas_to_rows,
     themes_to_rows,
     write_csv,
-    COMPOSITES_CSV_COLUMNS,
-    THEMES_CSV_COLUMNS,
 )
 
 
@@ -498,3 +506,280 @@ def test_write_csv_creates_file(tmp_path: Path) -> None:
         content = list(csv.DictReader(fh))
     assert len(content) == 1
     assert content[0]["theme_name"] == "T"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# load_composite_ideas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_composite_ideas_csv(path: Path, ideas: list[CompositeIdea]) -> None:
+    rows = composite_ideas_to_rows(ideas)
+    write_csv(str(path), COMPOSITES_CSV_COLUMNS, rows)
+
+
+def test_load_composite_ideas_basic(tmp_path: Path) -> None:
+    idea = CompositeIdea(
+        id="abc12345",
+        title="Test Idea",
+        theme_name="Robotics",
+        paper_ids=["0001", "0002"],
+        core_capability="Does something novel.",
+        added_value="Better together.",
+        target_user="ML engineer",
+        problem_statement="Hard to deploy.",
+        wedge_description="Narrow SaaS.",
+        risks="Hard to scale.",
+    )
+    csv_path = tmp_path / "ideas.csv"
+    _write_composite_ideas_csv(csv_path, [idea])
+    loaded = load_composite_ideas(str(csv_path))
+    assert len(loaded) == 1
+    assert loaded[0].title == "Test Idea"
+    assert loaded[0].paper_ids == ["0001", "0002"]
+    assert loaded[0].theme_name == "Robotics"
+
+
+def test_load_composite_ideas_skips_missing_file(tmp_path: Path) -> None:
+    loaded = load_composite_ideas(str(tmp_path / "nonexistent.csv"))
+    assert loaded == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# aggregate_paper_signals
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_aggregate_paper_signals_basic() -> None:
+    p1 = _paper("0001", overall_score=4, market_pull=3, technical_moat=4)
+    p2 = _paper("0002", overall_score=5, market_pull=5, technical_moat=3)
+    papers_by_id = {"0001": p1, "0002": p2}
+    signals = aggregate_paper_signals(["0001", "0002"], papers_by_id)
+    assert signals["avg_overall"] == 4.5
+    assert signals["avg_market_pull"] == 4.0
+    assert signals["avg_technical_moat"] == 3.5
+    assert signals["num_papers"] == 2
+
+
+def test_aggregate_paper_signals_empty_ids() -> None:
+    signals = aggregate_paper_signals([], {})
+    assert signals["avg_overall"] is None
+    assert signals["has_claude"] is False
+    assert signals["num_papers"] == 0
+
+
+def test_aggregate_paper_signals_has_claude_true() -> None:
+    p = _paper("0001", claude_final_score=4)
+    signals = aggregate_paper_signals(["0001"], {"0001": p})
+    assert signals["has_claude"] is True
+    assert signals["avg_claude_score"] == 4.0
+
+
+def test_aggregate_paper_signals_has_claude_false_when_none() -> None:
+    p = _paper("0001", claude_final_score=None)
+    signals = aggregate_paper_signals(["0001"], {"0001": p})
+    assert signals["has_claude"] is False
+    assert signals["avg_claude_score"] is None
+
+
+def test_aggregate_paper_signals_ignores_missing_ids() -> None:
+    p = _paper("0001", overall_score=4)
+    # "9999" not in papers_by_id — should be silently ignored
+    signals = aggregate_paper_signals(["0001", "9999"], {"0001": p})
+    assert signals["num_papers"] == 1
+    assert signals["avg_overall"] == 4.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build_scoring_prompt
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_idea(title: str = "Test Idea") -> CompositeIdea:
+    return CompositeIdea(
+        id="abc12345",
+        title=title,
+        theme_name="Robotics",
+        paper_ids=["0001", "0002"],
+        core_capability="Does X.",
+        added_value="Better.",
+        target_user="Engineer",
+        problem_statement="Hard.",
+        wedge_description="Narrow SaaS.",
+        risks="Competition.",
+    )
+
+
+def test_build_scoring_prompt_structure() -> None:
+    idea = _make_idea()
+    signals = {"avg_overall": 4.0, "avg_market_pull": 3.5, "avg_technical_moat": 4.0,
+               "avg_startup_potential": 4.0, "avg_story": 3.0,
+               "avg_claude_score": None, "has_claude": False, "num_papers": 2}
+    messages = build_scoring_prompt(idea, signals)
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert "Test Idea" in messages[1]["content"]
+    assert "Robotics" in messages[1]["content"]
+
+
+def test_build_scoring_prompt_includes_claude_note_when_available() -> None:
+    idea = _make_idea()
+    signals = {"avg_overall": 4.5, "avg_market_pull": 4.0, "avg_technical_moat": 4.0,
+               "avg_startup_potential": 4.0, "avg_story": 4.0,
+               "avg_claude_score": 4.5, "has_claude": True, "num_papers": 2}
+    messages = build_scoring_prompt(idea, signals)
+    assert "4.5" in messages[1]["content"]
+    assert "Claude debate score" in messages[1]["content"]
+
+
+def test_build_scoring_prompt_no_claude_note_when_missing() -> None:
+    idea = _make_idea()
+    signals = {"avg_overall": 3.0, "avg_market_pull": 3.0, "avg_technical_moat": 3.0,
+               "avg_startup_potential": 3.0, "avg_story": 3.0,
+               "avg_claude_score": None, "has_claude": False, "num_papers": 2}
+    messages = build_scoring_prompt(idea, signals)
+    assert "Stage 2 signals only" in messages[1]["content"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# parse_score_response
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_parse_score_response_valid() -> None:
+    raw = json.dumps({
+        "wedge_clarity": 4,
+        "technical_moat": 3,
+        "market_pull": 5,
+        "founder_fit": 4,
+        "composite_synergy": 3,
+        "scoring_notes": "Strong market pull but moat is weak.",
+    })
+    result = parse_score_response(raw)
+    assert result is not None
+    assert result["wedge_clarity"] == 4
+    assert result["market_pull"] == 5
+    assert result["scoring_notes"] == "Strong market pull but moat is weak."
+
+
+def test_parse_score_response_computes_weighted_score() -> None:
+    # All 5s → composite_score = 5.0
+    raw = json.dumps({
+        "wedge_clarity": 5, "technical_moat": 5, "market_pull": 5,
+        "founder_fit": 5, "composite_synergy": 5, "scoring_notes": "Perfect.",
+    })
+    result = parse_score_response(raw)
+    assert result is not None
+    assert result["composite_score"] == 5.0
+
+
+def test_parse_score_response_weighted_calculation() -> None:
+    # wedge=4, moat=2, pull=4, fit=2, synergy=2
+    # 0.25*4 + 0.20*2 + 0.25*4 + 0.15*2 + 0.15*2 = 1.0+0.4+1.0+0.3+0.3 = 3.0
+    raw = json.dumps({
+        "wedge_clarity": 4, "technical_moat": 2, "market_pull": 4,
+        "founder_fit": 2, "composite_synergy": 2, "scoring_notes": "Mixed.",
+    })
+    result = parse_score_response(raw)
+    assert result is not None
+    assert result["composite_score"] == 3.0
+
+
+def test_parse_score_response_invalid_json_returns_none() -> None:
+    result = parse_score_response("not json at all ~~~")
+    assert result is None
+
+
+def test_parse_score_response_missing_fields_gives_none_composite() -> None:
+    # Missing founder_fit → composite_score should be None
+    raw = json.dumps({
+        "wedge_clarity": 4, "technical_moat": 3, "market_pull": 4,
+        "scoring_notes": "Incomplete.",
+    })
+    result = parse_score_response(raw)
+    assert result is not None
+    assert result["composite_score"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# score_composite_ideas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _good_llm_fn(messages: list[dict]) -> str:
+    return json.dumps({
+        "wedge_clarity": 4, "technical_moat": 3, "market_pull": 4,
+        "founder_fit": 3, "composite_synergy": 4, "scoring_notes": "Looks good.",
+    })
+
+
+def _failing_llm_fn(messages: list[dict]) -> str:
+    raise RuntimeError("API error")
+
+
+def test_score_composite_ideas_success() -> None:
+    idea = _make_idea()
+    p = _paper("0001", overall_score=4)
+    result = score_composite_ideas([idea], {"0001": p}, _good_llm_fn)
+    assert len(result) == 1
+    assert result[0].wedge_clarity == 4
+    assert result[0].composite_score is not None
+    assert result[0].scoring_notes == "Looks good."
+
+
+def test_score_composite_ideas_fallback_on_failure() -> None:
+    idea = _make_idea()
+    result = score_composite_ideas([idea], {}, _failing_llm_fn)
+    assert len(result) == 1
+    assert result[0].composite_score is None
+    assert result[0].scoring_notes == "[scoring failed]"
+
+
+def test_score_composite_ideas_preserves_original_fields() -> None:
+    idea = _make_idea("My Startup Idea")
+    result = score_composite_ideas([idea], {}, _good_llm_fn)
+    assert result[0].title == "My Startup Idea"
+    assert result[0].theme_name == "Robotics"
+    assert result[0].paper_ids == ["0001", "0002"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# scored_ideas_to_rows
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scored_idea(title: str, score: float | None) -> ScoredCompositeIdea:
+    return ScoredCompositeIdea(
+        id="abc12345", title=title, theme_name="T", paper_ids=["0001"],
+        core_capability="X", added_value="Y", target_user="Z",
+        problem_statement="P", wedge_description="W", risks="R",
+        wedge_clarity=4 if score else None,
+        technical_moat=3 if score else None,
+        market_pull=4 if score else None,
+        founder_fit=3 if score else None,
+        composite_synergy=4 if score else None,
+        composite_score=score,
+        scoring_notes="Notes." if score else "[scoring failed]",
+    )
+
+
+def test_scored_ideas_to_rows_sorted_by_score_desc() -> None:
+    ideas = [_scored_idea("Low", 2.5), _scored_idea("High", 4.5), _scored_idea("Mid", 3.5)]
+    rows = scored_ideas_to_rows(ideas)
+    scores = [float(r["composite_score"]) for r in rows if r["composite_score"] != ""]
+    assert scores == sorted(scores, reverse=True)
+
+
+def test_scored_ideas_to_rows_unscored_last() -> None:
+    ideas = [_scored_idea("Scored", 3.5), _scored_idea("Failed", None)]
+    rows = scored_ideas_to_rows(ideas)
+    assert rows[0]["title"] == "Scored"
+    assert rows[1]["title"] == "Failed"
+    assert rows[1]["composite_score"] == ""
+
+
+def test_scored_ideas_to_rows_schema() -> None:
+    idea = _scored_idea("My Idea", 3.75)
+    rows = scored_ideas_to_rows([idea])
+    assert len(rows) == 1
+    row = rows[0]
+    for col in SCORED_COMPOSITES_CSV_COLUMNS:
+        assert col in row
+    assert row["title"] == "My Idea"
+    assert row["composite_score"] == 3.75
+    assert json.loads(row["paper_ids"]) == ["0001"]

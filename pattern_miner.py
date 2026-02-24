@@ -13,6 +13,13 @@ build_theme_summary_prompt(theme, papers)       -> list[dict]   # messages
 build_composite_prompt(theme, candidates)       -> list[dict]   # messages
 themes_to_rows(themes)            -> list[dict]  # for CSV writing
 composite_ideas_to_rows(ideas)    -> list[dict]  # for CSV writing
+
+load_composite_ideas(csv_path)               -> list[CompositeIdea]
+aggregate_paper_signals(paper_ids, papers)   -> dict
+build_scoring_prompt(idea, signals)          -> list[dict]   # messages
+parse_score_response(raw)                    -> dict | None
+score_composite_ideas(ideas, papers, llm_fn) -> list[ScoredCompositeIdea]
+scored_ideas_to_rows(ideas)                  -> list[dict]   # for CSV writing
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ import logging
 import os
 import re
 import uuid
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 LOGGER = logging.getLogger(__name__)
 
@@ -703,3 +710,367 @@ def parse_composite_response(
         wedge_description=str(data.get("wedge_description", "")),
         risks=str(data.get("risks", "")),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scoring layer — evaluate composite ideas on 5 axes via LLM
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ScoredCompositeIdea(NamedTuple):
+    """CompositeIdea enriched with 5-axis LLM scores and a weighted composite_score."""
+    id: str
+    title: str
+    theme_name: str
+    paper_ids: list[str]
+    core_capability: str
+    added_value: str
+    target_user: str
+    problem_statement: str
+    wedge_description: str
+    risks: str
+    wedge_clarity: int | None       # 1–5
+    technical_moat: int | None      # 1–5
+    market_pull: int | None         # 1–5
+    founder_fit: int | None         # 1–5
+    composite_synergy: int | None   # 1–5
+    composite_score: float | None   # weighted avg (see parse_score_response)
+    scoring_notes: str | None
+
+
+SCORED_COMPOSITES_CSV_COLUMNS = [
+    "id",
+    "theme_name",
+    "paper_ids",
+    "title",
+    "core_capability",
+    "added_value",
+    "target_user",
+    "problem_statement",
+    "wedge_description",
+    "risks",
+    "wedge_clarity",
+    "technical_moat",
+    "market_pull",
+    "founder_fit",
+    "composite_synergy",
+    "composite_score",
+    "scoring_notes",
+]
+
+
+def load_composite_ideas(csv_path: str) -> list[CompositeIdea]:
+    """Load composite ideas from a previously written CSV file.
+
+    Args:
+        csv_path: Path to the composite ideas CSV (papers_composite_ideas.csv).
+
+    Returns:
+        List of CompositeIdea objects, or [] if the file doesn't exist.
+    """
+    if not os.path.exists(csv_path):
+        LOGGER.warning("Composite ideas file not found: %s", csv_path)
+        return []
+    ideas: list[CompositeIdea] = []
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            try:
+                paper_ids = json.loads(row.get("paper_ids", "[]"))
+            except json.JSONDecodeError:
+                paper_ids = []
+            ideas.append(CompositeIdea(
+                id=row.get("id", ""),
+                title=row.get("title", ""),
+                theme_name=row.get("theme_name", ""),
+                paper_ids=paper_ids,
+                core_capability=row.get("core_capability", ""),
+                added_value=row.get("added_value", ""),
+                target_user=row.get("target_user", ""),
+                problem_statement=row.get("problem_statement", ""),
+                wedge_description=row.get("wedge_description", ""),
+                risks=row.get("risks", ""),
+            ))
+    LOGGER.info("Loaded %s composite ideas from %s", len(ideas), csv_path)
+    return ideas
+
+
+def aggregate_paper_signals(
+    paper_ids: list[str],
+    papers_by_id: dict[str, "AnalyzedPaper"],
+) -> dict[str, Any]:
+    """Compute average per-paper signals for a composite idea's source papers.
+
+    Args:
+        paper_ids: IDs of the papers that make up the composite idea.
+        papers_by_id: Full paper lookup dict.
+
+    Returns:
+        Dict with avg_* signal keys plus has_claude and num_papers.
+    """
+    papers = [papers_by_id[pid] for pid in paper_ids if pid in papers_by_id]
+    if not papers:
+        return {
+            "avg_overall": None,
+            "avg_startup_potential": None,
+            "avg_market_pull": None,
+            "avg_technical_moat": None,
+            "avg_story": None,
+            "avg_claude_score": None,
+            "has_claude": False,
+            "num_papers": 0,
+        }
+
+    def _avg(vals: list[int | None]) -> float | None:
+        valid = [v for v in vals if v is not None]
+        return round(sum(valid) / len(valid), 2) if valid else None
+
+    return {
+        "avg_overall": _avg([p.overall_score for p in papers]),
+        "avg_startup_potential": _avg([p.startup_potential for p in papers]),
+        "avg_market_pull": _avg([p.market_pull for p in papers]),
+        "avg_technical_moat": _avg([p.technical_moat for p in papers]),
+        "avg_story": _avg([p.story_for_accelerator for p in papers]),
+        "avg_claude_score": _avg([p.claude_final_score for p in papers]),
+        "has_claude": any(p.claude_final_score is not None for p in papers),
+        "num_papers": len(papers),
+    }
+
+
+_SCORING_SYSTEM = """\
+You are a deep-tech startup advisor scoring a composite startup idea derived from ML research papers.
+Score the idea on 5 axes (each 1–5, integer only) and add brief scoring_notes.
+
+Scoring rubric:
+- wedge_clarity (1-5): How narrow and concrete is the entry wedge? 5 = crisp wedge, clear first customer, obvious ROI.
+- technical_moat (1-5): How defensible is the underlying technology? 5 = novel combination, hard to replicate.
+- market_pull (1-5): How strong is market demand? 5 = clear pain, large market, buyers exist today.
+- founder_fit (1-5): How likely is a typical ML/AI founding team to execute this? 5 = obvious fit, familiar domain.
+- composite_synergy (1-5): Does combining the papers create more value than either alone? 5 = strong synergy, not just concatenation.
+
+Respond ONLY with valid JSON matching this schema:
+{
+  "wedge_clarity": <int 1-5>,
+  "technical_moat": <int 1-5>,
+  "market_pull": <int 1-5>,
+  "founder_fit": <int 1-5>,
+  "composite_synergy": <int 1-5>,
+  "scoring_notes": "<2-3 sentences on key strengths and concerns>"
+}"""
+
+
+def build_scoring_prompt(
+    idea: "CompositeIdea",
+    signals: dict[str, Any],
+) -> list[dict]:
+    """Build a messages list to score a composite startup idea.
+
+    Args:
+        idea: The composite idea to score.
+        signals: Aggregated paper signals from aggregate_paper_signals().
+
+    Returns:
+        messages list suitable for passing to an OpenAI chat call.
+    """
+    has_claude = signals.get("has_claude", False)
+    avg_claude = signals.get("avg_claude_score")
+    claude_note = (
+        f"Claude debate score (avg): {avg_claude}"
+        if has_claude and avg_claude is not None
+        else "No Claude debate data available (Stage 2 signals only)."
+    )
+
+    lines = [
+        f"Title: {idea.title}",
+        f"Theme: {idea.theme_name}",
+        f"Papers: {', '.join(idea.paper_ids)}",
+        "",
+        f"Core capability: {idea.core_capability}",
+        f"Added value: {idea.added_value}",
+        f"Target user: {idea.target_user}",
+        f"Problem statement: {idea.problem_statement}",
+        f"Wedge description: {idea.wedge_description}",
+        f"Risks: {idea.risks}",
+        "",
+        "Signals from source papers:",
+        f"  avg overall_score:        {signals.get('avg_overall', 'N/A')}",
+        f"  avg startup_potential:    {signals.get('avg_startup_potential', 'N/A')}",
+        f"  avg market_pull:          {signals.get('avg_market_pull', 'N/A')}",
+        f"  avg technical_moat:       {signals.get('avg_technical_moat', 'N/A')}",
+        f"  avg story_for_accel:      {signals.get('avg_story', 'N/A')}",
+        f"  {claude_note}",
+        "",
+        "Score this composite idea using the rubric in your system prompt.",
+    ]
+
+    return [
+        {"role": "system", "content": _SCORING_SYSTEM},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+def parse_score_response(raw: str) -> dict[str, Any] | None:
+    """Parse an LLM scoring response into a scores dict.
+
+    Computes weighted composite_score:
+        0.25 * wedge_clarity + 0.20 * technical_moat + 0.25 * market_pull
+        + 0.15 * founder_fit + 0.15 * composite_synergy
+
+    Args:
+        raw: Raw JSON string from the LLM.
+
+    Returns:
+        Dict with score keys and composite_score, or None on parse failure.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group())
+        except json.JSONDecodeError:
+            return None
+
+    wedge = _int(data.get("wedge_clarity"))
+    moat = _int(data.get("technical_moat"))
+    pull = _int(data.get("market_pull"))
+    fit = _int(data.get("founder_fit"))
+    synergy = _int(data.get("composite_synergy"))
+    notes = str(data.get("scoring_notes", "")).strip() or None
+
+    composite: float | None = None
+    if all(v is not None for v in [wedge, moat, pull, fit, synergy]):
+        composite = round(
+            0.25 * wedge + 0.20 * moat + 0.25 * pull + 0.15 * fit + 0.15 * synergy,  # type: ignore[operator]
+            2,
+        )
+
+    return {
+        "wedge_clarity": wedge,
+        "technical_moat": moat,
+        "market_pull": pull,
+        "founder_fit": fit,
+        "composite_synergy": synergy,
+        "composite_score": composite,
+        "scoring_notes": notes,
+    }
+
+
+def score_composite_ideas(
+    ideas: list[CompositeIdea],
+    papers_by_id: dict[str, "AnalyzedPaper"],
+    llm_fn: Callable[[list[dict]], str],
+) -> list[ScoredCompositeIdea]:
+    """Score each composite idea via the provided LLM function.
+
+    Makes up to 2 attempts per idea; falls back to a placeholder row on total failure.
+
+    Args:
+        ideas: List of composite ideas to score.
+        papers_by_id: Full paper lookup dict for aggregating signals.
+        llm_fn: Callable that takes a messages list and returns raw JSON string.
+
+    Returns:
+        List of ScoredCompositeIdea objects in the same order as input.
+    """
+    scored: list[ScoredCompositeIdea] = []
+
+    for idea in ideas:
+        signals = aggregate_paper_signals(idea.paper_ids, papers_by_id)
+        messages = build_scoring_prompt(idea, signals)
+        result: dict[str, Any] | None = None
+
+        for attempt in range(2):
+            try:
+                raw = llm_fn(messages)
+                result = parse_score_response(raw)
+                if result is not None:
+                    break
+            except Exception as exc:
+                LOGGER.warning(
+                    "Scoring attempt %s failed for '%s': %s", attempt + 1, idea.title, exc
+                )
+
+        if result is not None:
+            scored.append(ScoredCompositeIdea(
+                id=idea.id,
+                title=idea.title,
+                theme_name=idea.theme_name,
+                paper_ids=idea.paper_ids,
+                core_capability=idea.core_capability,
+                added_value=idea.added_value,
+                target_user=idea.target_user,
+                problem_statement=idea.problem_statement,
+                wedge_description=idea.wedge_description,
+                risks=idea.risks,
+                wedge_clarity=result["wedge_clarity"],
+                technical_moat=result["technical_moat"],
+                market_pull=result["market_pull"],
+                founder_fit=result["founder_fit"],
+                composite_synergy=result["composite_synergy"],
+                composite_score=result["composite_score"],
+                scoring_notes=result["scoring_notes"],
+            ))
+            LOGGER.info(
+                "Scored '%s': composite_score=%s",
+                idea.title,
+                result["composite_score"],
+            )
+        else:
+            scored.append(ScoredCompositeIdea(
+                id=idea.id,
+                title=idea.title,
+                theme_name=idea.theme_name,
+                paper_ids=idea.paper_ids,
+                core_capability=idea.core_capability,
+                added_value=idea.added_value,
+                target_user=idea.target_user,
+                problem_statement=idea.problem_statement,
+                wedge_description=idea.wedge_description,
+                risks=idea.risks,
+                wedge_clarity=None,
+                technical_moat=None,
+                market_pull=None,
+                founder_fit=None,
+                composite_synergy=None,
+                composite_score=None,
+                scoring_notes="[scoring failed]",
+            ))
+            LOGGER.warning("Scoring failed for '%s', using placeholder.", idea.title)
+
+    return scored
+
+
+def scored_ideas_to_rows(ideas: list[ScoredCompositeIdea]) -> list[dict]:
+    """Serialize scored ideas to flat dicts, sorted by composite_score descending.
+
+    Ideas with a score come before unscored fallback rows.
+    """
+    sorted_ideas = sorted(
+        ideas,
+        key=lambda i: (i.composite_score is not None, i.composite_score or 0.0),
+        reverse=True,
+    )
+    rows = []
+    for idea in sorted_ideas:
+        rows.append({
+            "id": idea.id,
+            "theme_name": idea.theme_name,
+            "paper_ids": json.dumps(idea.paper_ids),
+            "title": idea.title,
+            "core_capability": idea.core_capability,
+            "added_value": idea.added_value,
+            "target_user": idea.target_user,
+            "problem_statement": idea.problem_statement,
+            "wedge_description": idea.wedge_description,
+            "risks": idea.risks,
+            "wedge_clarity": idea.wedge_clarity if idea.wedge_clarity is not None else "",
+            "technical_moat": idea.technical_moat if idea.technical_moat is not None else "",
+            "market_pull": idea.market_pull if idea.market_pull is not None else "",
+            "founder_fit": idea.founder_fit if idea.founder_fit is not None else "",
+            "composite_synergy": idea.composite_synergy if idea.composite_synergy is not None else "",
+            "composite_score": idea.composite_score if idea.composite_score is not None else "",
+            "scoring_notes": idea.scoring_notes or "",
+        })
+    return rows

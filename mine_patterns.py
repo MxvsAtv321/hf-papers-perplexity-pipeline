@@ -11,6 +11,9 @@ python mine_patterns.py --generate-summaries
 # Full run: themes + composite startup ideas:
 python mine_patterns.py --generate-summaries --generate-composites
 
+# Score previously generated composite ideas (reads papers_composite_ideas.csv):
+python mine_patterns.py --score-composites
+
 # Custom inputs:
 python mine_patterns.py --input papers_debated.csv papers_wide_scout.csv --min-score 4
 
@@ -32,17 +35,25 @@ from openai import OpenAI
 
 from pattern_miner import (
     COMPOSITES_CSV_COLUMNS,
+    SCORED_COMPOSITES_CSV_COLUMNS,
     THEMES_CSV_COLUMNS,
-    CompositeIdea,
-    Theme,
     AnalyzedPaper,
+    CompositeIdea,
+    ScoredCompositeIdea,
+    Theme,
+    aggregate_paper_signals,
     build_composite_prompt,
+    build_scoring_prompt,
     build_theme_summary_prompt,
     composite_ideas_to_rows,
     extract_themes,
     find_composite_candidates,
+    load_composite_ideas,
     load_papers,
     parse_composite_response,
+    parse_score_response,
+    score_composite_ideas,
+    scored_ideas_to_rows,
     themes_to_rows,
     write_csv,
 )
@@ -52,6 +63,8 @@ LOGGER = logging.getLogger(__name__)
 _DEFAULT_INPUTS = ["papers_wide_scout.csv", "papers_debated.csv"]
 _DEFAULT_THEMES_OUT = "papers_themes.csv"
 _DEFAULT_COMPOSITES_OUT = "papers_composite_ideas.csv"
+_DEFAULT_COMPOSITES_IN = "papers_composite_ideas.csv"
+_DEFAULT_SCORED_OUT = "papers_composite_scored.csv"
 _OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 _OPENAI_TEMP = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
 
@@ -106,6 +119,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Cap number of themes to process (useful for quick testing).",
+    )
+    p.add_argument(
+        "--score-composites",
+        action="store_true",
+        help="Score composite ideas from --composites-in via OpenAI and write --scored-out.",
+    )
+    p.add_argument(
+        "--composites-in",
+        default=_DEFAULT_COMPOSITES_IN,
+        help=f"Input path for composite ideas CSV to score (default: {_DEFAULT_COMPOSITES_IN}).",
+    )
+    p.add_argument(
+        "--scored-out",
+        default=_DEFAULT_SCORED_OUT,
+        help=f"Output path for scored composite ideas CSV (default: {_DEFAULT_SCORED_OUT}).",
     )
     return p.parse_args()
 
@@ -190,6 +218,41 @@ def _generate_composite_ideas(
     return ideas
 
 
+def _run_score_composites(
+    composites_in: str,
+    scored_out: str,
+    papers_by_id: dict[str, AnalyzedPaper],
+    client: OpenAI,
+) -> list[ScoredCompositeIdea]:
+    """Load composite ideas, score each via OpenAI, and write the scored CSV.
+
+    Args:
+        composites_in: Path to the composite ideas CSV to score.
+        scored_out: Path to write the scored output CSV.
+        papers_by_id: Paper lookup dict for aggregating per-paper signals.
+        client: Authenticated OpenAI client.
+
+    Returns:
+        List of ScoredCompositeIdea objects.
+    """
+    ideas = load_composite_ideas(composites_in)
+    if not ideas:
+        print(f"No composite ideas found in: {composites_in}")
+        print("Run with --generate-composites first, or provide --composites-in.")
+        return []
+
+    print(f"\nScoring {len(ideas)} composite ideas via OpenAI...")
+
+    def llm_fn(messages: list[dict]) -> str:
+        return _call_openai_json(client, messages, max_tokens=512)
+
+    scored = score_composite_ideas(ideas, papers_by_id, llm_fn)
+    rows = scored_ideas_to_rows(scored)
+    write_csv(scored_out, SCORED_COMPOSITES_CSV_COLUMNS, rows)
+    print(f"Scored ideas written to: {scored_out}")
+    return scored
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Display helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -218,6 +281,46 @@ def _print_composite_ideas(ideas: list[CompositeIdea]) -> None:
         print(f"  Core cap:  {idea.core_capability[:120]}")
         print(f"  Wedge:     {idea.wedge_description[:120]}")
         print(f"  User:      {idea.target_user[:80]}")
+
+
+def _print_scored_ideas(ideas: list[ScoredCompositeIdea]) -> None:
+    if not ideas:
+        print("\nNo scored ideas to display.")
+        return
+
+    scored = [i for i in ideas if i.composite_score is not None]
+    failed = len(ideas) - len(scored)
+
+    # Score distribution
+    if scored:
+        scores = [i.composite_score for i in scored]  # type: ignore[misc]
+        avg = round(sum(scores) / len(scores), 2)
+        hi = max(scores)
+        lo = min(scores)
+        buckets = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
+        for s in scores:
+            bucket = min(5, max(1, round(s)))
+            buckets[bucket] = buckets.get(bucket, 0) + 1
+
+        print(f"\n{'─'*70}")
+        print(f"SCORED IDEAS — {len(scored)} scored, {failed} failed")
+        print(f"  avg={avg}  hi={hi}  lo={lo}")
+        print(f"  Distribution: " + "  ".join(f"{k}★:{v}" for k, v in sorted(buckets.items(), reverse=True)))
+        print(f"{'─'*70}")
+
+        top5 = sorted(scored, key=lambda i: i.composite_score or 0, reverse=True)[:5]
+        print("\nTOP 5 IDEAS:")
+        for rank, idea in enumerate(top5, 1):
+            print(f"\n  #{rank} [{idea.composite_score:.2f}] {idea.title}")
+            print(f"       Theme:  {idea.theme_name}")
+            print(f"       Wedge:  {idea.wedge_description[:100]}")
+            scores_line = (
+                f"W={idea.wedge_clarity} M={idea.market_pull} "
+                f"T={idea.technical_moat} F={idea.founder_fit} S={idea.composite_synergy}"
+            )
+            print(f"       Scores: {scores_line}")
+            if idea.scoring_notes:
+                print(f"       Notes:  {idea.scoring_notes[:160]}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,6 +382,12 @@ def main() -> None:
         )
         print(f"\nComposite candidates found (no LLM): {total_candidates}")
         print("Run with --generate-composites to evaluate and write them.")
+
+    # Score composite ideas (optional LLM call — reads --composites-in, writes --scored-out)
+    if args.score_composites:
+        client = _openai_client()
+        scored = _run_score_composites(args.composites_in, args.scored_out, papers_by_id, client)
+        _print_scored_ideas(scored)
 
 
 if __name__ == "__main__":
