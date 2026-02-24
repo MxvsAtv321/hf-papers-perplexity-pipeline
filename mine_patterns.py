@@ -14,6 +14,9 @@ python mine_patterns.py --generate-summaries --generate-composites
 # Score previously generated composite ideas (reads papers_composite_ideas.csv):
 python mine_patterns.py --score-composites
 
+# Add plain-language simple_summary to each scored idea:
+python mine_patterns.py --add-simple-summaries
+
 # Custom inputs:
 python mine_patterns.py --input papers_debated.csv papers_wide_scout.csv --min-score 4
 
@@ -36,14 +39,17 @@ from openai import OpenAI
 from pattern_miner import (
     COMPOSITES_CSV_COLUMNS,
     SCORED_COMPOSITES_CSV_COLUMNS,
+    SCORED_WITH_SUMMARY_CSV_COLUMNS,
     THEMES_CSV_COLUMNS,
     AnalyzedPaper,
     CompositeIdea,
     ScoredCompositeIdea,
     Theme,
+    add_simple_summaries_to_composites,
     aggregate_paper_signals,
     build_composite_prompt,
     build_scoring_prompt,
+    build_simple_summary_prompt,
     build_theme_summary_prompt,
     composite_ideas_to_rows,
     extract_themes,
@@ -52,6 +58,7 @@ from pattern_miner import (
     load_papers,
     parse_composite_response,
     parse_score_response,
+    parse_simple_summary_response,
     score_composite_ideas,
     scored_ideas_to_rows,
     themes_to_rows,
@@ -65,6 +72,8 @@ _DEFAULT_THEMES_OUT = "papers_themes.csv"
 _DEFAULT_COMPOSITES_OUT = "papers_composite_ideas.csv"
 _DEFAULT_COMPOSITES_IN = "papers_composite_ideas.csv"
 _DEFAULT_SCORED_OUT = "papers_composite_scored.csv"
+_DEFAULT_SCORED_IN = "papers_composite_scored.csv"
+_DEFAULT_SCORED_WITH_SUMMARY_OUT = "papers_composite_scored_with_summary.csv"
 _OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 _OPENAI_TEMP = float(os.getenv("OPENAI_TEMPERATURE", "0.1"))
 
@@ -134,6 +143,21 @@ def parse_args() -> argparse.Namespace:
         "--scored-out",
         default=_DEFAULT_SCORED_OUT,
         help=f"Output path for scored composite ideas CSV (default: {_DEFAULT_SCORED_OUT}).",
+    )
+    p.add_argument(
+        "--add-simple-summaries",
+        action="store_true",
+        help="Add a plain-language simple_summary column to --scored-in and write --scored-with-summary-out.",
+    )
+    p.add_argument(
+        "--scored-in",
+        default=_DEFAULT_SCORED_IN,
+        help=f"Input scored CSV for --add-simple-summaries (default: {_DEFAULT_SCORED_IN}).",
+    )
+    p.add_argument(
+        "--scored-with-summary-out",
+        default=_DEFAULT_SCORED_WITH_SUMMARY_OUT,
+        help=f"Output path with simple_summary added (default: {_DEFAULT_SCORED_WITH_SUMMARY_OUT}).",
     )
     return p.parse_args()
 
@@ -253,6 +277,21 @@ def _run_score_composites(
     return scored
 
 
+def _run_add_simple_summaries(
+    scored_in: str,
+    scored_with_summary_out: str,
+    client: OpenAI,
+) -> list[dict]:
+    """Add a plain-language simple_summary to each row of a scored composites CSV.
+
+    Standalone — does not require paper loading. Idempotent.
+    """
+    def llm_fn(messages: list[dict]) -> str:
+        return _call_openai_json(client, messages, max_tokens=300)
+
+    return add_simple_summaries_to_composites(scored_in, scored_with_summary_out, llm_fn)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Display helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,6 +362,21 @@ def _print_scored_ideas(ideas: list[ScoredCompositeIdea]) -> None:
                 print(f"       Notes:  {idea.scoring_notes[:160]}")
 
 
+def _print_simple_summaries(rows: list[dict], n: int = 5) -> None:
+    if not rows:
+        print("\nNo rows to display.")
+        return
+    show = rows[:n]
+    print(f"\n{'─'*80}")
+    print(f"PLAIN-LANGUAGE SUMMARIES  (top {len(show)} of {len(rows)})")
+    print(f"{'─'*80}")
+    for row in show:
+        score = row.get("composite_score", "")
+        score_display = f"[{score}]" if score else ""
+        print(f"\n{score_display} {row.get('title', '')}")
+        print(f"  {row.get('simple_summary', '')}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,6 +388,14 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     args = parse_args()
+
+    # Standalone path — no paper loading needed
+    if args.add_simple_summaries:
+        client = _openai_client()
+        print(f"\nAdding plain-language summaries: {args.scored_in} → {args.scored_with_summary_out}")
+        rows = _run_add_simple_summaries(args.scored_in, args.scored_with_summary_out, client)
+        _print_simple_summaries(rows, n=5)
+        return
 
     # Load and filter papers
     papers = load_papers(args.input, min_score=args.min_score)

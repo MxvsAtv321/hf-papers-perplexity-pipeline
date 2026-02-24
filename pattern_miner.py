@@ -20,6 +20,10 @@ build_scoring_prompt(idea, signals)          -> list[dict]   # messages
 parse_score_response(raw)                    -> dict | None
 score_composite_ideas(ideas, papers, llm_fn) -> list[ScoredCompositeIdea]
 scored_ideas_to_rows(ideas)                  -> list[dict]   # for CSV writing
+
+build_simple_summary_prompt(row)             -> list[dict]   # messages
+parse_simple_summary_response(raw)           -> str | None
+add_simple_summaries_to_composites(in, out, llm_fn) -> list[dict]
 """
 
 from __future__ import annotations
@@ -1074,3 +1078,163 @@ def scored_ideas_to_rows(ideas: list[ScoredCompositeIdea]) -> list[dict]:
             "scoring_notes": idea.scoring_notes or "",
         })
     return rows
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plain-language summary layer — add simple_summary to scored composite CSV
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCORED_WITH_SUMMARY_CSV_COLUMNS = SCORED_COMPOSITES_CSV_COLUMNS + ["simple_summary"]
+
+_SIMPLE_SUMMARY_SYSTEM = """\
+You are a plain-language writer. Your job: write a simple_summary of an AI startup idea
+for a smart, curious reader who is NOT deep in AI research or ML infrastructure.
+
+RULES
+- 3–5 sentences. Strictly 120–150 words. Count carefully.
+- No jargon. No unexplained acronyms.
+- BANNED phrases — replace with plain English:
+    "latent space", "world model", "diffusion model", "transformer", "embedding",
+    "kernel-level", "MoE", "mixture of experts", "foundation model", "fine-tuning",
+    "RLHF", "inference pipeline", "neural architecture", "self-supervised",
+    "tokenizer", "autoregressive", "contrastive learning".
+- If a technical concept is truly essential, explain it in everyday words.
+  Example: instead of "world model" write "a system that learns to predict what
+  happens next based on past examples".
+- STRUCTURE (strictly in this order):
+    1. One sentence — who this product is for.
+    2. One–two sentences — what it does, in plain everyday words.
+    3. One–two sentences — why it matters and what makes it special vs "just another AI tool".
+- Tone: clear, direct, confident. No marketing fluff. No exclamation marks.
+
+Respond ONLY with valid JSON:
+{"simple_summary": "<string>"}"""
+
+
+def build_simple_summary_prompt(row: dict[str, Any]) -> list[dict]:
+    """Build a messages list to generate a plain-language summary for one scored idea.
+
+    Args:
+        row: A flat dict of a scored composite idea (from papers_composite_scored.csv).
+
+    Returns:
+        messages list suitable for passing to an OpenAI chat call.
+    """
+    score = row.get("composite_score", "")
+    score_display = f"{score}/5" if score else "not scored"
+
+    lines = [
+        f"Title: {row.get('title', '')}",
+        f"Theme: {row.get('theme_name', '')}",
+        f"Score: {score_display}",
+        "",
+        f"What it can do: {row.get('core_capability', '')}",
+        f"Why combining the research helps: {row.get('added_value', '')}",
+        f"Who it's for: {row.get('target_user', '')}",
+        f"Problem it solves: {row.get('problem_statement', '')}",
+        f"Entry wedge: {row.get('wedge_description', '')}",
+        "",
+        "Write the simple_summary following your rules exactly.",
+    ]
+
+    return [
+        {"role": "system", "content": _SIMPLE_SUMMARY_SYSTEM},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+_MAX_SUMMARY_WORDS = 170  # hard cap; spec says ~150 words, allow small buffer
+
+
+def parse_simple_summary_response(raw: str) -> str | None:
+    """Parse an LLM plain-language summary response.
+
+    Returns the summary string, or None if parsing fails or the text is empty /
+    over the word limit.
+    """
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group())
+        except json.JSONDecodeError:
+            return None
+
+    summary = str(data.get("simple_summary", "")).strip()
+    if not summary:
+        return None
+    word_count = len(summary.split())
+    if word_count > _MAX_SUMMARY_WORDS:
+        LOGGER.warning("simple_summary too long (%s words), rejecting", word_count)
+        return None
+    return summary
+
+
+def add_simple_summaries_to_composites(
+    input_csv: str,
+    output_csv: str,
+    llm_fn: Callable[[list[dict]], str],
+) -> list[dict]:
+    """Read a scored composites CSV, add a plain-language simple_summary per row.
+
+    Idempotent: always overwrites output_csv. Makes up to 2 LLM attempts per row;
+    falls back to "[summary unavailable]" on total failure.
+
+    Args:
+        input_csv: Path to the scored composite ideas CSV (papers_composite_scored.csv).
+        output_csv: Path to write the enriched output CSV.
+        llm_fn: Callable that takes a messages list and returns raw JSON string.
+
+    Returns:
+        List of enriched row dicts (same order as input, with simple_summary added).
+    """
+    if not os.path.exists(input_csv):
+        LOGGER.warning("Input CSV not found: %s", input_csv)
+        return []
+
+    with open(input_csv, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
+
+    if not rows:
+        LOGGER.warning("No rows found in %s", input_csv)
+        return []
+
+    LOGGER.info("Loaded %s rows from %s", len(rows), input_csv)
+
+    out_columns = fieldnames + (
+        ["simple_summary"] if "simple_summary" not in fieldnames else []
+    )
+
+    enriched: list[dict] = []
+    for row in rows:
+        messages = build_simple_summary_prompt(row)
+        summary: str | None = None
+
+        for attempt in range(2):
+            try:
+                raw = llm_fn(messages)
+                summary = parse_simple_summary_response(raw)
+                if summary is not None:
+                    break
+            except Exception as exc:
+                LOGGER.warning(
+                    "simple_summary attempt %s failed for '%s': %s",
+                    attempt + 1, row.get("title", "?"), exc,
+                )
+
+        out_row = dict(row)
+        out_row["simple_summary"] = summary if summary is not None else "[summary unavailable]"
+        if summary is None:
+            LOGGER.warning("simple_summary fallback for '%s'", row.get("title", "?"))
+        else:
+            LOGGER.info("simple_summary ok for '%s'", row.get("title", "?"))
+        enriched.append(out_row)
+
+    write_csv(output_csv, out_columns, enriched)
+    LOGGER.info("Wrote %s enriched rows to %s", len(enriched), output_csv)
+    return enriched

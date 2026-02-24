@@ -16,13 +16,16 @@ from pattern_miner import (
     Theme,
     COMPOSITES_CSV_COLUMNS,
     SCORED_COMPOSITES_CSV_COLUMNS,
+    SCORED_WITH_SUMMARY_CSV_COLUMNS,
     THEMES_CSV_COLUMNS,
     _are_complementary,
     _collapse_product_angles,
     _row_to_paper,
+    add_simple_summaries_to_composites,
     aggregate_paper_signals,
     build_composite_prompt,
     build_scoring_prompt,
+    build_simple_summary_prompt,
     build_theme_summary_prompt,
     composite_ideas_to_rows,
     extract_themes,
@@ -31,6 +34,7 @@ from pattern_miner import (
     load_papers,
     parse_composite_response,
     parse_score_response,
+    parse_simple_summary_response,
     score_composite_ideas,
     score_paper_against_theme,
     scored_ideas_to_rows,
@@ -783,3 +787,197 @@ def test_scored_ideas_to_rows_schema() -> None:
     assert row["title"] == "My Idea"
     assert row["composite_score"] == 3.75
     assert json.loads(row["paper_ids"]) == ["0001"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# build_simple_summary_prompt
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _scored_row(title: str = "My Idea", score: str = "4.25") -> dict:
+    return {
+        "id": "abc12345",
+        "title": title,
+        "theme_name": "Robotics",
+        "paper_ids": '["0001", "0002"]',
+        "core_capability": "Trains robots to pick objects without manual labelling.",
+        "added_value": "Combining two papers lets the system adapt to new objects faster.",
+        "target_user": "Warehouse automation engineers at mid-size logistics companies.",
+        "problem_statement": "Setting up a new robot gripper requires weeks of manual data collection.",
+        "wedge_description": "Start with a narrow plug-in for one popular robot arm brand.",
+        "risks": "Sim-to-real gap; large players may copy.",
+        "wedge_clarity": "4", "technical_moat": "3", "market_pull": "4",
+        "founder_fit": "3", "composite_synergy": "4",
+        "composite_score": score,
+        "scoring_notes": "Strong wedge, moderate moat.",
+    }
+
+
+def test_build_simple_summary_prompt_structure() -> None:
+    row = _scored_row()
+    messages = build_simple_summary_prompt(row)
+    assert len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+
+
+def test_build_simple_summary_prompt_contains_key_fields() -> None:
+    row = _scored_row("Robotic Gripping Suite", "4.25")
+    messages = build_simple_summary_prompt(row)
+    content = messages[1]["content"]
+    assert "Robotic Gripping Suite" in content
+    assert "Robotics" in content
+    assert "4.25" in content
+
+
+def test_build_simple_summary_prompt_no_score_graceful() -> None:
+    row = _scored_row(score="")
+    messages = build_simple_summary_prompt(row)
+    assert "not scored" in messages[1]["content"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# parse_simple_summary_response
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ok_summary() -> str:
+    """A valid summary under 170 words."""
+    return (
+        "This product is for warehouse operations teams at mid-size logistics companies. "
+        "It makes robot arms learn to pick up new objects without weeks of manual setup — "
+        "you show it a few examples and it figures out the rest automatically. "
+        "Most warehouse robots today need a specialist to reconfigure them every time a new "
+        "product arrives, which causes expensive downtime. This tool cuts that setup time "
+        "from weeks to hours by combining two research advances: one that generates training "
+        "data automatically, and another that lets the robot adapt quickly on the job."
+    )
+
+
+def test_parse_simple_summary_response_valid() -> None:
+    raw = json.dumps({"simple_summary": _ok_summary()})
+    result = parse_simple_summary_response(raw)
+    assert result is not None
+    assert "warehouse" in result.lower()
+
+
+def test_parse_simple_summary_response_too_long_returns_none() -> None:
+    too_long = " ".join(["word"] * 200)
+    raw = json.dumps({"simple_summary": too_long})
+    result = parse_simple_summary_response(raw)
+    assert result is None
+
+
+def test_parse_simple_summary_response_empty_returns_none() -> None:
+    raw = json.dumps({"simple_summary": ""})
+    assert parse_simple_summary_response(raw) is None
+
+
+def test_parse_simple_summary_response_invalid_json_returns_none() -> None:
+    assert parse_simple_summary_response("not json ~~~") is None
+
+
+def test_parse_simple_summary_response_strips_whitespace() -> None:
+    raw = json.dumps({"simple_summary": "  Hello world.  "})
+    result = parse_simple_summary_response(raw)
+    assert result == "Hello world."
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# add_simple_summaries_to_composites
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_scored_csv(path: Path, rows: list[dict]) -> None:
+    cols = list(rows[0].keys())
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=cols)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _good_summary_fn(messages: list[dict]) -> str:
+    return json.dumps({"simple_summary": _ok_summary()})
+
+
+def _failing_summary_fn(messages: list[dict]) -> str:
+    raise RuntimeError("API error")
+
+
+def test_add_simple_summaries_creates_output_file(tmp_path: Path) -> None:
+    in_csv = tmp_path / "scored.csv"
+    out_csv = tmp_path / "scored_with_summary.csv"
+    _write_scored_csv(in_csv, [_scored_row("Idea A"), _scored_row("Idea B")])
+
+    result = add_simple_summaries_to_composites(str(in_csv), str(out_csv), _good_summary_fn)
+
+    assert os.path.exists(str(out_csv))
+    assert len(result) == 2
+
+
+def test_add_simple_summaries_output_has_simple_summary_column(tmp_path: Path) -> None:
+    in_csv = tmp_path / "scored.csv"
+    out_csv = tmp_path / "out.csv"
+    _write_scored_csv(in_csv, [_scored_row("My Idea")])
+
+    add_simple_summaries_to_composites(str(in_csv), str(out_csv), _good_summary_fn)
+
+    with out_csv.open(newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+    assert "simple_summary" in rows[0]
+    assert rows[0]["simple_summary"] != ""
+    assert rows[0]["title"] == "My Idea"
+
+
+def test_add_simple_summaries_preserves_existing_columns(tmp_path: Path) -> None:
+    in_csv = tmp_path / "scored.csv"
+    out_csv = tmp_path / "out.csv"
+    row = _scored_row("Preserve Me")
+    _write_scored_csv(in_csv, [row])
+
+    add_simple_summaries_to_composites(str(in_csv), str(out_csv), _good_summary_fn)
+
+    with out_csv.open(newline="", encoding="utf-8") as fh:
+        out_row = list(csv.DictReader(fh))[0]
+    # All original columns still present
+    for col in row.keys():
+        assert col in out_row
+    assert out_row["composite_score"] == row["composite_score"]
+
+
+def test_add_simple_summaries_fallback_on_failure(tmp_path: Path) -> None:
+    in_csv = tmp_path / "scored.csv"
+    out_csv = tmp_path / "out.csv"
+    _write_scored_csv(in_csv, [_scored_row("Failing Idea")])
+
+    result = add_simple_summaries_to_composites(str(in_csv), str(out_csv), _failing_summary_fn)
+
+    assert result[0]["simple_summary"] == "[summary unavailable]"
+
+
+def test_add_simple_summaries_idempotent(tmp_path: Path) -> None:
+    """Running twice overwrites output without duplicating rows."""
+    in_csv = tmp_path / "scored.csv"
+    out_csv = tmp_path / "out.csv"
+    _write_scored_csv(in_csv, [_scored_row("Idea")])
+
+    add_simple_summaries_to_composites(str(in_csv), str(out_csv), _good_summary_fn)
+    add_simple_summaries_to_composites(str(in_csv), str(out_csv), _good_summary_fn)
+
+    with out_csv.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 1  # not duplicated
+
+
+def test_add_simple_summaries_skips_missing_input(tmp_path: Path) -> None:
+    result = add_simple_summaries_to_composites(
+        str(tmp_path / "nonexistent.csv"),
+        str(tmp_path / "out.csv"),
+        _good_summary_fn,
+    )
+    assert result == []
+
+
+def test_scored_with_summary_csv_columns_includes_simple_summary() -> None:
+    assert "simple_summary" in SCORED_WITH_SUMMARY_CSV_COLUMNS
+    # All scored columns also present
+    for col in SCORED_COMPOSITES_CSV_COLUMNS:
+        assert col in SCORED_WITH_SUMMARY_CSV_COLUMNS
