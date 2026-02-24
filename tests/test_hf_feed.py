@@ -173,3 +173,16 @@ def test_fetch_papers_hf_fetch_days_env_controls_request_count() -> None:
         fetch_papers(max_age_days=30)
 
     assert mock_get.call_count == 3
+
+
+def test_fetch_papers_fetch_days_param_overrides_env() -> None:
+    """fetch_days= parameter takes precedence over HF_FETCH_DAYS env var."""
+    now = datetime.now(UTC)
+    payload = _make_payload([("2501.00001", "Paper A", now - timedelta(days=1))])
+
+    # Env says 5 days; caller passes fetch_days=2 — should make exactly 2 requests.
+    with patch.dict("os.environ", {"HF_FETCH_DAYS": "5"}), \
+         patch("hf_feed.requests.get", return_value=_mock_resp(payload)) as mock_get:
+        fetch_papers(max_age_days=30, fetch_days=2)
+
+    assert mock_get.call_count == 2

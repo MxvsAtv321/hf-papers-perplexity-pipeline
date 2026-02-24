@@ -13,6 +13,7 @@ from typing import Any
 from models import Paper
 
 CSV_OUTPUT_PATH = os.getenv("CSV_OUTPUT_PATH", "papers_pipeline.csv")
+WIDE_SCOUT_CSV_PATH = os.getenv("WIDE_SCOUT_CSV_PATH", "papers_wide_scout.csv")
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,9 +62,14 @@ CSV_COLUMNS = [
 ]
 
 
-def paper_already_exists(paper: Paper) -> bool:
-    """Return True if a row with paper.paper_id already exists in the CSV."""
-    path = Path(CSV_OUTPUT_PATH)
+def paper_already_exists(paper: Paper, csv_path: str | None = None) -> bool:
+    """Return True if a row with paper.paper_id already exists in the CSV.
+
+    Args:
+        paper: Paper to look up by paper_id.
+        csv_path: Path to the CSV file. Defaults to CSV_OUTPUT_PATH.
+    """
+    path = Path(csv_path or CSV_OUTPUT_PATH)
     if not path.exists():
         return False
 
@@ -81,6 +87,7 @@ def write_paper_entry(
     score: dict[str, Any] | None = None,
     debate: dict[str, Any] | None = None,
     stages: dict[str, bool] | None = None,
+    csv_path: str | None = None,
 ) -> None:
     """Append a row to the CSV (creating it with a header if needed).
 
@@ -90,8 +97,9 @@ def write_paper_entry(
         score:    Optional Stage-2 OpenAI scoring dict.
         debate:   Optional Stage-3 Claude debate verdict dict (normalized).
         stages:   Optional dict of stage flags (stage1_passed … stage4_analyzed).
+        csv_path: Path to the CSV file. Defaults to CSV_OUTPUT_PATH.
     """
-    path = Path(CSV_OUTPUT_PATH)
+    path = Path(csv_path or CSV_OUTPUT_PATH)
     write_header = not path.exists() or path.stat().st_size == 0
 
     summary = analysis.get("summary", {}) if isinstance(analysis.get("summary"), dict) else {}
@@ -167,7 +175,7 @@ def write_paper_entry(
             writer.writeheader()
         writer.writerow(row)
 
-    LOGGER.info("Wrote CSV row for paper_id=%s to %s", paper.paper_id, CSV_OUTPUT_PATH)
+    LOGGER.info("Wrote CSV row for paper_id=%s to %s", paper.paper_id, csv_path or CSV_OUTPUT_PATH)
 
 
 def _as_text(value: Any, max_len: int = 500) -> str:

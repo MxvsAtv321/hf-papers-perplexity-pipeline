@@ -19,22 +19,29 @@ _DEFAULT_MAX_AGE_DAYS = 180
 _DEFAULT_FETCH_DAYS = 7
 
 
-def fetch_papers(limit: int | None = None, max_age_days: int | None = None) -> list[Paper]:
+def fetch_papers(
+    limit: int | None = None,
+    max_age_days: int | None = None,
+    fetch_days: int | None = None,
+) -> list[Paper]:
     """Fetch and normalize papers from Hugging Face Daily Papers.
 
-    Fetches from the past HF_FETCH_DAYS days (default 7) by iterating over
-    ?date=YYYY-MM-DD query parameters, then deduplicates, age-filters, and
-    applies the limit.
+    Fetches from the past fetch_days days (default: HF_FETCH_DAYS env var, or 7)
+    by iterating over ?date=YYYY-MM-DD query parameters, then deduplicates,
+    age-filters, and applies the limit.
 
     Args:
         limit: Optional max number of papers to return after age filtering.
         max_age_days: Max age in days for recency filtering. Reads HF_MAX_AGE_DAYS
             env var if not supplied; defaults to 180.
+        fetch_days: How many past days to request from the HF API. Overrides the
+            HF_FETCH_DAYS env var when supplied; defaults to 7.
     """
     if max_age_days is None:
         max_age_days = int(os.environ.get("HF_MAX_AGE_DAYS", _DEFAULT_MAX_AGE_DAYS))
 
-    fetch_days = int(os.environ.get("HF_FETCH_DAYS", _DEFAULT_FETCH_DAYS))
+    if fetch_days is None:
+        fetch_days = int(os.environ.get("HF_FETCH_DAYS", _DEFAULT_FETCH_DAYS))
     today = datetime.now(UTC).date()
 
     papers_by_id: dict[str, Paper] = {}
